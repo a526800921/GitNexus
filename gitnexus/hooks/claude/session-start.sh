@@ -29,10 +29,10 @@ This codebase is indexed by GitNexus, providing a knowledge graph with execution
 - `query` — Process-grouped code intelligence (execution flows related to a concept)
 - `context` — 360-degree symbol view (categorized refs, process participation)
 - `impact` — Blast radius analysis (what breaks if you change a symbol)
+- `trace` — Shortest path between two symbols
 - `detect_changes` — Git-diff impact analysis (what do your changes affect)
 - `rename` — Multi-file coordinated rename with confidence tags
 - `cypher` — Raw graph queries
-- `list_repos` — Discover indexed repos
 
 **Quick Start:** READ `gitnexus://repo/{name}/context` for codebase overview, then use `query` to find execution flows.
 
