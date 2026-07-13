@@ -3,6 +3,9 @@ name: gitnexus-taint-analysis
 description: "Use when working on, reviewing, or extending GitNexus's CFG/taint/PDG subsystem (the `--pdg` layers), or when reasoning about source→sink data-flow findings. Examples: \"How does taint analysis work here?\", \"Why didn't explain find this flow?\", \"Add a new sink/source\", \"Review the interprocedural taint code\"."
 ---
 
+> ⚠️ 本 Fork 精简版：`explain` 工具已注释，默认不可用。
+> 如需恢复，在 `gitnexus/src/mcp/tools.ts` 中取消 `explain` 的注释并重新 build。
+
 # CFG & Taint Analysis with GitNexus
 
 Expert knowledge for the opt-in `--pdg` program-analysis subsystem: control-flow

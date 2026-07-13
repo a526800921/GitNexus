@@ -3,6 +3,9 @@ name: gitnexus-pdg-query
 description: "Use when querying or extending GitNexus's PDG control/data-dependence surface (the `pdg_query` MCP tool, CDG/REACHING_DEF edges), or reasoning about \"what controls X\" / \"where does Y flow\" / guard clauses. Examples: \"what guards this statement?\", \"trace this variable within the function\", \"why is the pdg_query result empty?\", \"add a CDG query\"."
 ---
 
+> ⚠️ 本 Fork 精简版：`pdg_query` 工具已注释，默认不可用。
+> 如需恢复，在 `gitnexus/src/mcp/tools.ts` 中取消 `pdg_query` 的注释并重新 build。
+
 # PDG query surface with GitNexus
 
 Expert knowledge for the `pdg_query` MCP tool and the control/data-dependence
