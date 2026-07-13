@@ -593,6 +593,100 @@ DESTINATION TRACE (cross-repo): for an "@groupName" trace, OMIT to/to_uid/to_fil
       required: [],
     },
   },
+  // ─── API路由类工具（默认注释，需要时取消注释） ─────────────────
+  // {
+  //   name: 'route_map',
+  //   description: `Show API route mappings: which components/hooks fetch which API endpoints, and which handler files serve them.
+  //
+  // WHEN TO USE: Understanding API consumption patterns, finding orphaned routes. For pre-change analysis, prefer \`api_impact\` which combines this data with mismatch detection and risk assessment.
+  // AFTER THIS: Use impact() on specific route handlers to see full blast radius.
+  //
+  // Returns: route nodes with their handlers, middleware wrapper chains (e.g., withAuth, withRateLimit), and consumers. Each route object includes its "method" (the HTTP verb, "*" for method-agnostic routes, or null for method-less routes).`,
+  //   annotations: READ_ONLY_TOOL_ANNOTATIONS,
+  //   inputSchema: {
+  //     type: 'object',
+  //     properties: {
+  //       route: {
+  //         type: 'string',
+  //         description: 'Filter by route path (e.g., "/api/grants"). Omit for all routes.',
+  //       },
+  //       repo: {
+  //         type: 'string',
+  //         description: 'Repository name or path. Omit if only one repo is indexed.',
+  //       },
+  //     },
+  //     required: [],
+  //   },
+  // },
+  // {
+  //   name: 'tool_map',
+  //   description: `Show MCP/RPC tool definitions: which tools are defined, where they're handled, and their descriptions.
+  //
+  // WHEN TO USE: Understanding tool APIs, finding tool implementations, impact analysis for tool changes.
+  //
+  // Returns: tool nodes with their handler files and descriptions.`,
+  //   annotations: READ_ONLY_TOOL_ANNOTATIONS,
+  //   inputSchema: {
+  //     type: 'object',
+  //     properties: {
+  //       tool: { type: 'string', description: 'Filter by tool name. Omit for all tools.' },
+  //       repo: { type: 'string', description: 'Repository name or path.' },
+  //     },
+  //     required: [],
+  //   },
+  // },
+  // {
+  //   name: 'shape_check',
+  //   description: `Check response shapes for API routes against their consumers' property accesses.
+  //
+  // WHEN TO USE: Detecting mismatches between what an API route returns and what consumers expect. Finding shape drift. For pre-change analysis, prefer \`api_impact\` which combines this data with mismatch detection and risk assessment.
+  // REQUIRES: Route nodes with responseKeys (extracted from .json({...}) calls during indexing).
+  //
+  // Returns routes that have both detected response keys AND consumers. Shows top-level keys each endpoint returns (e.g., data, pagination, error) and what keys each consumer accesses. Reports MISMATCH status when a consumer accesses keys not present in the route's response shape. Each route object includes its "method" (the HTTP verb, "*" for method-agnostic routes, or null for method-less routes).`,
+  //   annotations: READ_ONLY_TOOL_ANNOTATIONS,
+  //   inputSchema: {
+  //     type: 'object',
+  //     properties: {
+  //       route: {
+  //         type: 'string',
+  //         description: 'Check a specific route (e.g., "/api/grants"). Omit to check all routes.',
+  //       },
+  //       repo: {
+  //         type: 'string',
+  //         description: 'Repository name or path. Omit if only one repo is indexed.',
+  //       },
+  //     },
+  //     required: [],
+  //   },
+  // },
+  // {
+  //   name: 'api_impact',
+  //   description: `Pre-change impact report for an API route handler.
+  //
+  // WHEN TO USE: BEFORE modifying any API route handler. Shows what consumers depend on, what response fields they access, what middleware protects the route, and what execution flows it triggers. Requires at least "route" or "file" parameter.
+  //
+  // Risk levels: LOW (0-3 consumers), MEDIUM (4-9 or any mismatches), HIGH (10+ consumers or mismatches with 4+ consumers). Mismatches with confidence "low" indicate the consumer file fetches multiple routes — property attribution is approximate.
+  //
+  // Response shape is keyed on how many routes match, not on the data: exactly one match returns a single route object; two or more return { routes: [...], total: N }. The same URL can expose multiple HTTP verbs (e.g. GET and POST /api/orders are distinct routes that share the URL), so a bare-URL lookup may return the wrapped form — every route object carries its own "method" so verbs are distinguishable. Pass "method" to narrow to one verb; the single-object shape is returned only when exactly one route remains after filtering — a substring route/file match spanning several URLs can still return the wrapped form. A URL/file that exists but has no route for the given verb returns an error. Each route's "method" is the literal "*" for method-agnostic routes (e.g. Django function views), which match any "method" selector, or null for method-less routes (filesystem, Laravel resource), which never match a selector. Combines route_map, shape_check, and impact data.`,
+  //   annotations: READ_ONLY_TOOL_ANNOTATIONS,
+  //   inputSchema: {
+  //     type: 'object',
+  //     properties: {
+  //       route: { type: 'string', description: 'Route path (e.g., "/api/grants")' },
+  //       file: { type: 'string', description: 'Handler file path (alternative to route)' },
+  //       method: {
+  //         type: 'string',
+  //         description:
+  //           'Optional HTTP verb — GET, POST, PUT, PATCH, DELETE, etc. — to narrow a multi-verb route or file lookup to a single method. Returns an error if no matched route uses that verb.',
+  //       },
+  //       repo: { type: 'string', description: 'Repository name or path.' },
+  //     },
+  //     required: [],
+  //     // Exactly one lookup key is needed, but either works (route wins if both
+  //     // are passed) — so the structural constraint is "at least one of route/file".
+  //     anyOf: [{ required: ['route'] }, { required: ['file'] }],
+  //   },
+  // },
 ];
 
 /**
@@ -610,6 +704,11 @@ const BRANCH_SCOPED_TOOLS = new Set([
   'impact',
   'rename',
   'trace',
+  // 取消注释API路由工具时，同步取消下面的注释：
+  // 'route_map',
+  // 'tool_map',
+  // 'shape_check',
+  // 'api_impact',
 ]);
 
 for (const tool of GITNEXUS_TOOLS) {
