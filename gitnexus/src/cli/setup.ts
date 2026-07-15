@@ -158,16 +158,21 @@ function resolveGitnexusBin(): string | null {
 /**
  * The MCP server entry for all editors.
  *
- * Prefers the globally-installed `gitnexus` binary (starts in ~1 s) over
- * `npx -y gitnexus@<version>` (cold-cache install of native deps can take
- * >60 s, exceeding Claude Code's 30 s MCP connection timeout). The fallback
- * version is read from gitnexus/package.json#version at module load so the
- * persisted user config matches the installed package.
+ * When running from a local checkout (detected by __dirname not containing
+ * `node_modules`), uses `node dist/cli/index.js` directly so that local source
+ * changes take effect after a rebuild — no npx or global install needed.
  *
- * Falls back to npx when the binary isn't on PATH — e.g. first-time
- * users who ran `npx gitnexus analyze` but haven't done `npm i -g`.
+ * Otherwise prefers the globally-installed `gitnexus` binary (starts in ~1 s)
+ * over `npx -y gitnexus@<version>` (cold-cache install of native deps can take
+ * >60 s, exceeding Claude Code's 30 s MCP connection timeout).
  */
 function getMcpEntry() {
+  // Local checkout: point to the local build instead of npx / global bin
+  if (!__dirname.includes('node_modules')) {
+    const localIndex = path.resolve(__dirname, '..', '..', 'dist', 'cli', 'index.js');
+    return { command: 'node', args: [localIndex, 'mcp'] };
+  }
+
   const bin = resolveGitnexusBin();
 
   if (bin) {
@@ -192,6 +197,12 @@ function getMcpEntry() {
  * where command is a flat array (command + args combined).
  */
 function getOpenCodeMcpEntry() {
+  // Local checkout: point to the local build
+  if (!__dirname.includes('node_modules')) {
+    const localIndex = path.resolve(__dirname, '..', '..', 'dist', 'cli', 'index.js');
+    return { type: 'local', command: ['node', localIndex, 'mcp'] };
+  }
+
   const bin = resolveGitnexusBin();
 
   if (bin) {
