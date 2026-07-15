@@ -92,21 +92,17 @@ export const GITNEXUS_TOOLS: ToolDefinition[] = [
   {
     name: 'query',
     description: `Query the code knowledge graph for execution flows related to a concept.
-Returns processes (call chains) ranked by relevance, each with its symbols and file locations.
+Returns processes (call chains) ranked by relevance, with symbols and file locations.
 
-WHEN TO USE: Understanding how code works together. Use this when you need execution flows and relationships, not just file matches. Complements grep/IDE search.
-AFTER THIS: Use context() on a specific symbol for 360-degree view (callers, callees, categorized refs).
+Results grouped by process:
+- processes: ranked execution flows
+- process_symbols: symbols with file locations and module
+- definitions: types/interfaces not in any process
 
-Returns results grouped by process (execution flow):
-- processes: ranked execution flows with relevance priority
-- process_symbols: all symbols in those flows with file locations and module (functional area)
-- definitions: standalone types/interfaces not in any process
+Hybrid ranking: BM25 + semantic vector search.
 
-Hybrid ranking: BM25 keyword + semantic vector search, ranked by Reciprocal Rank Fusion.
-
-GROUP MODE: set "repo" to "@<groupName>" to search all member repos in that group (merged via RRF), or "@<groupName>/<groupRepoPath>" to run against a single member (same path keys as in group.yaml). If you use "@<groupName>" only, the member repo defaults to the lexicographically first key in group.yaml "repos". Prefer resources for contracts/status (see migration from legacy group_* tools).
-
-SERVICE: optional monorepo path prefix (POSIX-style, case-sensitive segments). When "repo" starts with "@", only processes whose symbols fall under that prefix are included. For a normal indexed repo name (no leading @), this field is currently ignored by the server.`,
+GROUP MODE: "repo" → "@group" searches all members (RRF-merged); "@group/sub" scopes to one.
+SERVICE: optional monorepo path prefix, case-sensitive. Only applies in @group mode.`,
     annotations: QUERY_TOOL_ANNOTATIONS,
     inputSchema: {
       type: 'object',
@@ -121,16 +117,15 @@ SERVICE: optional monorepo path prefix (POSIX-style, case-sensitive segments). W
         },
         task_context: {
           type: 'string',
-          description: 'What you are working on (e.g., "adding OAuth support"). Helps ranking.',
+          description: 'What you are working on (e.g., "adding OAuth support").',
         },
         goal: {
           type: 'string',
-          description:
-            'What you want to find (e.g., "existing auth validation logic"). Helps ranking.',
+          description: 'What you want to find (e.g., "existing auth validation logic").',
         },
         limit: {
           type: 'number',
-          description: 'Max processes to return (default: 5)',
+          description: 'Max processes (default: 5)',
           default: 5,
           minimum: 1,
           maximum: 100,
@@ -144,19 +139,19 @@ SERVICE: optional monorepo path prefix (POSIX-style, case-sensitive segments). W
         },
         include_content: {
           type: 'boolean',
-          description: 'Include full symbol source code (default: false)',
+          description: 'Include full source code (default: false)',
           default: false,
         },
         repo: {
           type: 'string',
           description:
-            'Indexed repository name or path, or group mode "@<groupName>" / "@<groupName>/<memberPath>" (member path keys from group.yaml). Omit when only one indexed repo exists.',
+            'Repository name/path, or "@<groupName>" / "@<groupName>/<memberPath>". Omit if only one repo indexed.',
         },
         service: {
           type: 'string',
           minLength: 1,
           description:
-            'Optional monorepo service root (relative path, "/" separators). In group mode (@repo), prefix-matches symbol file paths; ignored for a normal repo name. Empty string is rejected server-side.',
+            'Monorepo service root (relative path). Only applies in @group mode. Empty string rejected.',
         },
       },
       required: ['search_query'],
@@ -166,52 +161,13 @@ SERVICE: optional monorepo path prefix (POSIX-style, case-sensitive segments). W
     name: 'cypher',
     description: `Execute Cypher query against the code knowledge graph.
 
-WHEN TO USE: Complex structural queries that search/explore can't answer. READ gitnexus://repo/{name}/schema first for the full schema.
-AFTER THIS: Use context() on result symbols for deeper context.
+Schema: File, Folder, Function, Class, Interface, Method, CodeElement, Community, Process, Route, Tool. Multi-lang: \`Struct\`, \`Enum\`, \`Trait\`, \`Impl\`. Single CodeRelation table with 'type'. Edge types: ${REL_TYPES.join(', ')}. Edge props: type, confidence, reason, step.
 
-SCHEMA:
-- Nodes: File, Folder, Function, Class, Interface, Method, CodeElement, Community, Process, Route, Tool
-- Multi-language nodes (use backticks): \`Struct\`, \`Enum\`, \`Trait\`, \`Impl\`, etc.
-- All edges via single CodeRelation table with 'type' property
-- Edge types: ${REL_TYPES.join(', ')} — CFG, REACHING_DEF, TAINTED, SANITIZES, TAINT_PATH, CDG, POST_DOMINATE are populated ONLY on indexes built with \`gitnexus analyze --pdg\` (zero rows on a default index); OVERRIDES is a legacy alias — rows are written as METHOD_OVERRIDES
-- Edge properties: type (STRING), confidence (DOUBLE), reason (STRING), step (INT32)
+PDG edge types (CFG, CDG, REACHING_DEF, TAINTED, SANITIZES, TAINT_PATH, POST_DOMINATE) only with \`gitnexus analyze --pdg\`.
 
-EXAMPLES:
-• Find callers of a function:
-  MATCH (a)-[:CodeRelation {type: 'CALLS'}]->(b:Function {name: "validateUser"}) RETURN a.name, a.filePath
+Returns { markdown, row_count } — results as Markdown table.
 
-• Find community members:
-  MATCH (f)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community) WHERE c.heuristicLabel = "Auth" RETURN f.name
-
-• Trace a process:
-  MATCH (s)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process) WHERE p.heuristicLabel = "UserLogin" RETURN s.name, r.step ORDER BY r.step
-
-• Find all methods of a class:
-  MATCH (c:Class {name: "UserService"})-[r:CodeRelation {type: 'HAS_METHOD'}]->(m:Method) RETURN m.name, m.parameterCount, m.returnType
-
-• Find all properties of a class:
-  MATCH (c:Class {name: "User"})-[r:CodeRelation {type: 'HAS_PROPERTY'}]->(p:Property) RETURN p.name, p.declaredType
-
-• Find all writers of a field:
-  MATCH (f:Function)-[r:CodeRelation {type: 'ACCESSES', reason: 'write'}]->(p:Property) WHERE p.name = "address" RETURN f.name, f.filePath
-
-• Find method overrides (MRO resolution):
-  MATCH (winner:Method)-[r:CodeRelation {type: 'METHOD_OVERRIDES'}]->(loser:Method) RETURN winner.name, winner.filePath, loser.filePath, r.reason
-
-• Find DI-injected implementations (beans injected into a consumer class):
-  MATCH (c:Class {name: 'OrderService'})-[r:CodeRelation]->(impl:Class) WHERE r.type = 'INJECTS' RETURN impl.name, r.reason
-
-• Detect diamond inheritance:
-  MATCH (d:Class)-[:CodeRelation {type: 'EXTENDS'}]->(b1), (d)-[:CodeRelation {type: 'EXTENDS'}]->(b2), (b1)-[:CodeRelation {type: 'EXTENDS'}]->(a), (b2)-[:CodeRelation {type: 'EXTENDS'}]->(a) WHERE b1 <> b2 RETURN d.name, b1.name, b2.name, a.name
-
-OUTPUT: Returns { markdown, row_count } — results formatted as a Markdown table for easy reading.
-
-TIPS:
-- All relationships use single CodeRelation table — filter with {type: 'CALLS'} etc.
-- Community = auto-detected functional area (Leiden algorithm). Properties: heuristicLabel, cohesion, symbolCount, keywords, description, enrichedBy
-- Process = execution flow trace from entry point to terminal. Properties: heuristicLabel, processType, stepCount, communities, entryPointId, terminalId
-- Use heuristicLabel (not label) for human-readable community/process names
-- PDG layers (only when indexed with \`--pdg\`): BasicBlock nodes + CFG / CDG (control dependence, branch sense 'T'|'F' in reason) / REACHING_DEF (def→use, variable in reason) edges, all BasicBlock→BasicBlock. Prefer the \`pdg_query\` tool — it anchors + bounds these for you (raw \`[:CDG*]\`/\`[:REACHING_DEF*]\` path scans are unindexed and unbounded).`,
+TIPS: Use heuristicLabel for community/process names. Filter edges with {type: 'CALLS'} etc.`,
     annotations: READ_ONLY_TOOL_ANNOTATIONS,
     inputSchema: {
       type: 'object',
@@ -231,7 +187,7 @@ TIPS:
         },
         repo: {
           type: 'string',
-          description: 'Repository name or path. Omit if only one repo is indexed.',
+          description: 'Repository name/path. Omit if only one repo indexed.',
         },
       },
       required: ['statement'],
@@ -239,19 +195,12 @@ TIPS:
   },
   {
     name: 'context',
-    description: `360-degree view of a single code symbol.
-Shows categorized incoming/outgoing references (calls, imports, extends, implements, methods, properties, overrides), process participation, and file location.
+    description: `360-degree view of a code symbol: callers, callees, imports, extends/impl, methods, properties, process participation.
 
-WHEN TO USE: After query() to understand a specific symbol in depth. When you need to know all callers, callees, and what execution flows a symbol participates in.
-AFTER THIS: Use impact() if planning changes, or READ gitnexus://repo/{name}/process/{processName} for full execution trace.
+Handles disambiguation: ranked candidates for same-name symbols. Use uid for zero-ambiguity, or narrow with file_path/kind.
 
-Handles disambiguation: if multiple symbols share the same name, returns ranked candidates (each with a relevance score) for you to pick from. Use uid for zero-ambiguity lookup, or narrow the search with file_path and/or kind hints.
-
-NOTE: ACCESSES edges (field read/write tracking) are included in context results with reason 'read' or 'write'. CALLS edges resolve through field access chains and method-call chains (e.g., user.address.getCity().save() produces CALLS edges at each step).
-
-GROUP MODE: set "repo" to "@<groupName>" to run context in each member repo (aggregated list), or "@<groupName>/<groupRepoPath>" for one member. If you use "@<groupName>" only, the member defaults to the lexicographically first key in group.yaml "repos".
-
-SERVICE: optional monorepo path prefix (case-sensitive path segments). When "repo" starts with "@", prefix-matches resolved symbol file paths; when a hit is outside the prefix, that member returns an empty payload for the symbol. Ignored for a normal indexed repo name.`,
+GROUP MODE: "repo" → "@group" returns per-member results; "@group/sub" scopes to one.
+SERVICE: optional monorepo path prefix, case-sensitive. Only applies in @group mode.`,
     annotations: READ_ONLY_TOOL_ANNOTATIONS,
     inputSchema: {
       type: 'object',
@@ -269,19 +218,19 @@ SERVICE: optional monorepo path prefix (case-sensitive path segments). When "rep
         },
         include_content: {
           type: 'boolean',
-          description: 'Include full symbol source code (default: false)',
+          description: 'Include full source code (default: false)',
           default: false,
         },
         repo: {
           type: 'string',
           description:
-            'Indexed repository name or path, or group mode "@<groupName>" / "@<groupName>/<memberPath>". Omit if only one repo is indexed.',
+            'Repository name/path, or "@<groupName>" / "@<groupName>/<memberPath>". Omit if only one repo indexed.',
         },
         service: {
           type: 'string',
           minLength: 1,
           description:
-            'Optional monorepo service root (relative path). Applies in group mode (@repo) only; ignored for a normal repo name. Empty string is rejected server-side.',
+            'Monorepo service root (relative path). Only applies in @group mode. Empty string rejected.',
         },
       },
       required: [],
@@ -290,14 +239,11 @@ SERVICE: optional monorepo path prefix (case-sensitive path segments). When "rep
   {
     name: 'detect_changes',
     description: `Analyze uncommitted git changes and find affected execution flows.
-Maps git diff hunks to indexed symbols, then traces which processes are impacted.
+Maps git diff hunks to indexed symbols, traces which processes are impacted.
 
-WHEN TO USE: Before committing — to understand what your changes affect. Pre-commit review, PR preparation.
-AFTER THIS: Review affected processes. Use context() on high-risk symbols. READ gitnexus://repo/{name}/process/{name} for full traces.
+Returns: changed symbols, affected processes, risk summary.
 
-GIT WORKTREE SUPPORT: GitNexus automatically detects when the MCP server was launched from inside a linked git worktree and runs git diff against that worktree — no extra parameters needed in the common case. Pass "worktree" explicitly only when the server was started from a different directory than the worktree you are editing (e.g., the server runs from the canonical root but your changes are in a linked worktree at a different path).
-
-Returns: changed symbols, affected processes, and a risk summary.`,
+WORKTREE: auto-detects linked git worktree. Pass "worktree" param only when MCP server runs from a different directory than the worktree being edited.`,
     annotations: READ_ONLY_TOOL_ANNOTATIONS,
     inputSchema: {
       type: 'object',
@@ -315,11 +261,11 @@ Returns: changed symbols, affected processes, and a risk summary.`,
         worktree: {
           type: 'string',
           description:
-            'Absolute path to a linked git worktree. Pass this when your changes are in a worktree (the .git entry at that path is a file, not a directory). GitNexus will run git diff from that worktree so staged/unstaged changes are correctly detected.',
+            'Absolute path to a linked git worktree. Pass this when your changes are in a worktree (the .git entry at that path is a file). GitNexus runs git diff from that worktree.',
         },
         repo: {
           type: 'string',
-          description: 'Repository name or path. Omit if only one repo is indexed.',
+          description: 'Repository name/path. Omit if only one repo indexed.',
         },
       },
       required: [],
@@ -327,15 +273,8 @@ Returns: changed symbols, affected processes, and a risk summary.`,
   },
   {
     name: 'rename',
-    description: `Multi-file coordinated rename using the knowledge graph + text search.
-Finds all references via graph (high confidence) and regex text search (lower confidence). Preview by default.
-
-WHEN TO USE: Renaming a function, class, method, or variable across the codebase. Safer than find-and-replace.
-AFTER THIS: Run detect_changes() to verify no unexpected side effects.
-
-Each edit is tagged with confidence:
-- "graph": found via knowledge graph relationships (high confidence, safe to accept)
-- "text_search": found via regex text search (lower confidence, review carefully)`,
+    description: `Multi-file coordinated rename using knowledge graph + text search.
+Finds references via graph (tagged "graph", high confidence) and regex ("text_search", lower confidence). Preview by default.`,
     annotations: DESTRUCTIVE_TOOL_ANNOTATIONS,
     inputSchema: {
       type: 'object',
@@ -354,7 +293,7 @@ Each edit is tagged with confidence:
         },
         repo: {
           type: 'string',
-          description: 'Repository name or path. Omit if only one repo is indexed.',
+          description: 'Repository name/path. Omit if only one repo indexed.',
         },
       },
       required: ['new_name'],
@@ -363,41 +302,18 @@ Each edit is tagged with confidence:
   {
     name: 'impact',
     description: `Analyze the blast radius of changing a code symbol.
-Returns affected symbols grouped by depth, plus risk assessment, affected execution flows, and affected modules.
+Returns affected symbols grouped by depth, risk assessment, affected processes, and modules.
 
-MODE (opt-in): "callgraph" (default) walks symbol→symbol edges (CALLS/IMPORTS/EXTENDS/IMPLEMENTS) — inter-procedural, the established comparator/default behavior. "pdg" requires an index built with \`gitnexus analyze --pdg\` and returns one unified PDG-facing result: statement-level control/data dependence from the persisted PDG plus inter-procedural symbol reach. The explicit interprocedural surface is interproceduralByDepth/pdgInterprocedural; byDepth remains the compatibility symbol bucket. pdg remains incompatible with crossDepth and @group targets; relationTypes/minConfidence filter the inter-symbol reach.
+MODE: "callgraph" (default) walks symbol→symbol edges (CALLS/IMPORTS/EXTENDS/IMPLEMENTS). "pdg" uses program-dependence graph (requires \`gitnexus analyze --pdg\`); pass "line" for statement-anchored slice. PDG incompatible with crossDepth/@group targets.
 
-STATEMENT-ANCHORED PDG SLICE: with mode:'pdg', pass "line" (1-based source line within the target symbol) to seed the dependence slice on the statement at that line and return what depends on it in affectedStatements (line + text). Inter-procedural symbols are still reported through interproceduralByDepth/pdgInterprocedural and the compatibility byDepth bucket. Without "line", pdg returns whole-symbol inter-procedural reach plus local whole-symbol PDG diagnostics.
+Output: risk (LOW/MEDIUM/HIGH/CRITICAL/UNKNOWN), summary, affected_processes, affected_modules, byDepth (d=1 WILL BREAK, d=2 LIKELY AFFECTED, d=3 MAY NEED TESTING).
 
-PDG OUTPUT CONTRACT: every mode:'pdg' result (success, empty, degraded, or error) carries pdgResultVersion:2 — a stable discriminator for external consumers that bumps on any breaking change to the PDG result shape (distinct from the DB schema version). Successful PDG results include mode:'pdg', a full target envelope (id/name/type/filePath), affectedStatements, affectedStatementCount, interproceduralByDepth/pdgInterprocedural for cross-function reach, compatibility byDepth/byDepthCounts, risk:'UNKNOWN', and a note describing the unified contract. Degraded PDG results (no-layer, sub-layer-missing, unknown) keep mode:'pdg', pdgResultVersion:2, target metadata when the target resolves, risk:'UNKNOWN', note/remediation, and empty byDepth parity fields — never a false-safe zero. If depth and limit both bound the slice, truncatedByReasons reports both causes while truncatedBy remains scalar.
+TIPS: For hub symbols use summaryOnly:true first. Include HAS_METHOD/HAS_PROPERTY for class members, ACCESSES for field writes.
 
-WHEN TO USE: Before making code changes — especially refactoring, renaming, or modifying shared code. Shows what would break.
-AFTER THIS: Review d=1 items (WILL BREAK). Use context() on high-risk symbols.
+Disambiguation: ranked candidates for same-name targets. Use target_uid for zero-ambiguity.
 
-Output includes:
-- risk: LOW / MEDIUM / HIGH / CRITICAL / UNKNOWN
-- summary: direct callers, processes affected, modules affected
-- affected_processes: which execution flows break and at which step
-- affected_modules: which functional areas are hit (direct vs indirect)
-- byDepth: affected symbols grouped by traversal depth (paginated by limit/offset; omitted when summaryOnly:true — use byDepthCounts for totals per depth, pagination object when truncated). Each item includes a processes:[{id,label,processType,step}] field listing the execution flows that symbol participates in. Empty when the symbol has no process membership. Can ALSO be empty when partial:true is set — either the process-aggregation pass hit its cap before detecting affected processes, or per-symbol enrichment was capped on a very large page. When partial:true, do NOT treat processes:[] as proof of no participation; cross-check the top-level affected_processes list.
-
-Depth groups:
-- d=1: WILL BREAK (direct callers/importers)
-- d=2: LIKELY AFFECTED (indirect)
-- d=3: MAY NEED TESTING (transitive)
-
-TIP: For hub symbols (base error classes, shared utilities) with many direct callers, use summaryOnly: true first to see counts and risk, then drill into specific depths with limit/offset. maxDepth alone does not bound output size when most dependents are at depth 1. limit and offset apply independently to each depth level, not to the total result set — use byDepthCounts to see totals per depth.
-
-TIP: Default traversal uses CALLS/IMPORTS/EXTENDS/IMPLEMENTS. For class members, include HAS_METHOD and HAS_PROPERTY in relationTypes. For field access analysis, include ACCESSES in relationTypes.
-
-Handles disambiguation: when multiple symbols share the target name, returns ranked candidates (each with a relevance score) instead of silently picking one. Use target_uid for zero-ambiguity lookup, or narrow with file_path and/or kind hints.
-
-EdgeType: CALLS, IMPORTS, EXTENDS, IMPLEMENTS, HAS_METHOD, HAS_PROPERTY, METHOD_OVERRIDES, METHOD_IMPLEMENTS, ACCESSES
-Confidence: 1.0 = certain, <0.8 = fuzzy match
-
-GROUP MODE: set "repo" to "@<groupName>" for cross-repo impact anchored at the default member (lexicographically first key in group.yaml "repos"), or "@<groupName>/<groupRepoPath>" to choose the member (same path keys as in group.yaml). Phase-1 walk runs in that member; cross-boundary fan-out uses the group bridge.
-
-SERVICE: optional monorepo path prefix (case-sensitive path segments). When "repo" starts with "@", scopes the local impact walk and cross-repo symbol paths to files under that prefix; ignored for a normal indexed repo name.`,
+GROUP MODE: "repo" → "@group" for cross-repo impact; "@group/sub" chooses the member.
+SERVICE: optional monorepo path prefix, case-sensitive. Only applies in @group mode.`,
     annotations: READ_ONLY_TOOL_ANNOTATIONS,
     inputSchema: {
       type: 'object',
@@ -417,18 +333,14 @@ SERVICE: optional monorepo path prefix (case-sensitive path segments). When "rep
           enum: ['callgraph', 'pdg'],
           default: 'callgraph',
           description:
-            "Blast-radius engine. 'callgraph' (default) = inter-procedural symbol→symbol traversal (established comparator). 'pdg' = unified PDG-facing impact: intra-procedural statement-level affectedStatements from the persisted control/data dependence layer plus inter-procedural symbols in interproceduralByDepth/pdgInterprocedural and the compatibility byDepth bucket; requires `gitnexus analyze --pdg`. PDG symbol reach is labeled as a PDG evidence bridge, not pure statement-level dependence, and successful PDG results are UNKNOWN-risk. PDG is incompatible with crossDepth and @group targets; relationTypes/minConfidence filter the inter-symbol reach.",
+            "Blast-radius engine. 'callgraph' (default): symbol→symbol edges. 'pdg': program-dependence graph (requires `gitnexus analyze --pdg`). PDG is incompatible with crossDepth and @group targets; relationTypes/minConfidence filter inter-symbol reach.",
         },
         line: {
           type: 'integer',
-          // `minimum: 0` (not 1) so strict client/agent adapters that materialize
-          // an omitted optional numeric field as `0` do not reject the request
-          // before sending (#2279). A positive line is still required for a real
-          // pdg anchor — the backend enforces that — but `0`/omitted means "no
-          // statement anchor" and is tolerated on the callgraph path.
+          // minimum:0 so adapters that materialize omitted fields as 0 don't reject (#2279).
           minimum: 0,
           description:
-            "1-based source line — PDG statement anchor (mode:'pdg'). Seeds affectedStatements on the statement at this line; inter-procedural symbols are still returned in interproceduralByDepth/pdgInterprocedural and the compatibility byDepth bucket. Omit line for whole-symbol pdg (whole-symbol reach + diagnostics); a positive line anchors a statement slice. Literal 0 is tolerated only as an omitted-line compatibility sentinel on the callgraph path and is rejected for mode:'pdg'.",
+            "1-based source line for PDG statement-anchored slice (mode:'pdg'). Omit for whole-symbol PDG. Literal 0 = omitted (callgraph path) and is rejected for mode:'pdg'.",
         },
         file_path: {
           type: 'string',
@@ -448,8 +360,7 @@ SERVICE: optional monorepo path prefix (case-sensitive path segments). When "rep
         },
         crossDepth: {
           type: 'number',
-          description:
-            'Cross-repository hop depth via contract bridge (default: 1; values above server maximum are clamped)',
+          description: 'Cross-repo hop depth via contract bridge (default: 1, clamped to max)',
           default: 1,
           minimum: 1,
           maximum: 32,
@@ -458,13 +369,12 @@ SERVICE: optional monorepo path prefix (case-sensitive path segments). When "rep
           type: 'array',
           items: { type: 'string' },
           description:
-            'Filter: CALLS, IMPORTS, EXTENDS, IMPLEMENTS, HAS_METHOD, HAS_PROPERTY, METHOD_OVERRIDES, METHOD_IMPLEMENTS, ACCESSES (default: usage-based, ACCESSES excluded by default). DI fan-out (consumer→implementer) requires explicitly including INJECTS.',
+            'Filter: CALLS, IMPORTS, EXTENDS, IMPLEMENTS, HAS_METHOD, HAS_PROPERTY, METHOD_OVERRIDES, METHOD_IMPLEMENTS, ACCESSES. DI fan-out needs INJECTS.',
         },
         includeTests: { type: 'boolean', description: 'Include test files (default: false)' },
         minConfidence: {
           type: 'number',
-          description:
-            'Minimum edge confidence 0–1 (default: 0 when omitted; server clamps to 0–1)',
+          description: 'Minimum edge confidence 0–1 (default: 0)',
           default: 0,
           minimum: 0,
           maximum: 1,
@@ -472,13 +382,13 @@ SERVICE: optional monorepo path prefix (case-sensitive path segments). When "rep
         repo: {
           type: 'string',
           description:
-            'Indexed repository name or path, or group mode "@<groupName>" / "@<groupName>/<memberPath>". Omit if only one repo is indexed.',
+            'Repository name/path, or "@<groupName>" / "@<groupName>/<memberPath>". Omit if only one repo indexed.',
         },
         service: {
           type: 'string',
           minLength: 1,
           description:
-            'Optional monorepo service root (relative path). Applies when "repo" is group mode (@…); ignored for a normal repo name. Empty string is rejected server-side.',
+            'Monorepo service root (relative path). Only applies in @group mode. Empty string rejected.',
         },
         subgroup: {
           type: 'string',
@@ -488,7 +398,7 @@ SERVICE: optional monorepo path prefix (case-sensitive path segments). When "rep
         limit: {
           type: 'integer',
           description:
-            'Max symbols returned in byDepth per depth level (default: 100). Single-repo only; ignored in group mode (@groupName). Use small values for hub symbols to avoid output truncation.',
+            'Max symbols per depth level (default: 100). Single-repo only. Use small values for hub symbols.',
           default: 100,
           minimum: 1,
           maximum: 10000,
@@ -496,26 +406,25 @@ SERVICE: optional monorepo path prefix (case-sensitive path segments). When "rep
         offset: {
           type: 'integer',
           description:
-            'Skip this many symbols per depth level before applying limit. Single-repo only; ignored in group mode (@groupName). Use with limit for pagination.',
+            'Skip N symbols per depth level. Single-repo only. Use with limit for pagination.',
           default: 0,
           minimum: 0,
         },
         summaryOnly: {
           type: 'boolean',
           description:
-            'When true, returns target, summary, risk, byDepthCounts, affected_processes, and affected_modules — omits byDepth. Single-repo only; ignored in group mode (@groupName). Use for hub symbols to get actionable signal without output explosion.',
+            'Omits byDepth, returns counts only. Single-repo only. Use for hub symbols with many callers.',
           default: false,
         },
         timeoutMs: {
           type: 'number',
-          description:
-            'Wall-clock budget in milliseconds for the Phase-1 local impact leg (default 30000)',
+          description: 'Budget in ms for the local impact phase (default 30000)',
           minimum: 1,
           maximum: 3600000,
         },
         timeout: {
           type: 'number',
-          description: 'Alias of timeoutMs (milliseconds) when timeoutMs is omitted',
+          description: 'Alias of timeoutMs',
           minimum: 1,
           maximum: 3600000,
         },
@@ -525,17 +434,11 @@ SERVICE: optional monorepo path prefix (case-sensitive path segments). When "rep
   },
   {
     name: 'trace',
-    description: `Find the shortest directed path between two symbols over call and class-member edges.
+    description: `Find the shortest directed path between two symbols over call/class-member edges.
+Traverses CALLS + HAS_METHOD edges. Returns ordered hops with file:line and edges[]. When no path exists, reports the furthest reachable node.
 
-WHEN TO USE: Debugging "how does A reach B?" — answers in one call what would take 3-8 manual context/impact hops. Shows the exact chain with file:line positions plus a per-hop edge type and confidence.
-
-Traverses CALLS edges plus HAS_METHOD (class → member) edges, so a trace can descend from a class into its methods. Each hop's edge type is reported in edges[], so call hops and containment hops remain distinguishable.
-
-Returns: ordered hops with file:line, and an aligned edges[] of edge type + confidence. When no path exists, reports the furthest reachable node so you know where the chain breaks (and truncated: true if a traversal cap was hit first).
-
-CROSS-REPO (experimental): pass repo as "@groupName" to trace across repositories in a group. When from/to live in different member repos, the trace stitches the two repo-local segments across a single ContractLink boundary (e.g. an HTTP consumer→provider link), clamped to one crossing. The result adds crossings[] (the bridged contract with matchType/confidence), tags each hop with its member repo, and a notes[] channel for degraded states. The boundary hop is reported with edge type CONTRACT_LINK. Pass pdg:true to also attach the intra-procedural data-flow (REACHING_DEF) for boundary-adjacent segments when those repos were indexed with --pdg; absent a PDG layer it degrades to call-level hops with a note.
-
-DESTINATION TRACE (cross-repo): for an "@groupName" trace, OMIT to/to_uid/to_file to trace 'from' to wherever its outgoing HTTP call lands. The result ends at the provider endpoint (reported by route + file even when the handler is an anonymous function with no nameable symbol). This is the way to follow a client call to a backend handler you cannot name.`,
+CROSS-REPO: use "@groupName" repo to auto-stitch traces across members at ContractLink boundaries.
+DESTINATION TRACE: omit to/to_uid/to_file to follow an HTTP call to its handler.`,
     annotations: READ_ONLY_TOOL_ANNOTATIONS,
     inputSchema: {
       type: 'object',
@@ -546,7 +449,7 @@ DESTINATION TRACE (cross-repo): for an "@groupName" trace, OMIT to/to_uid/to_fil
         to: {
           type: 'string',
           description:
-            "Target symbol name. Omit (with to_uid/to_file) on an @group trace to trace 'from' to its HTTP destination.",
+            "Target symbol name. Omit to trace 'from' to its HTTP destination (@group only).",
         },
         to_uid: { type: 'string', description: 'Target symbol UID (zero-ambiguity)' },
         to_file: { type: 'string', description: 'Target file path hint for disambiguation' },
@@ -559,19 +462,19 @@ DESTINATION TRACE (cross-repo): for an "@groupName" trace, OMIT to/to_uid/to_fil
         },
         includeTests: {
           type: 'boolean',
-          description: 'Include test-file symbols in traversal (default: false)',
+          description: 'Include test files (default: false)',
           default: false,
         },
         pdg: {
           type: 'boolean',
           description:
-            'Cross-repo only (experimental): attach intra-procedural REACHING_DEF data-flow for boundary-adjacent segments when the repo has a --pdg layer. Default false.',
+            'Cross-repo only: attach REACHING_DEF data-flow for boundary-adjacent segments. Default false.',
           default: false,
         },
         crossDepth: {
           type: 'number',
           description:
-            'Cross-repo only: number of ContractLink boundaries to cross. Only 1 is supported today (multi-hop deferred); a direct caller that passes a higher value gets it clamped to 1 with a notes[] entry.',
+            'Cross-repo only: ContractLink boundary crossings. Only 1 is supported; higher values are clamped to 1.',
           default: 1,
           minimum: 1,
           maximum: 1,
@@ -579,7 +482,7 @@ DESTINATION TRACE (cross-repo): for an "@groupName" trace, OMIT to/to_uid/to_fil
         limit: {
           type: 'number',
           description:
-            'Cross-repo + pdg:true only: max REACHING_DEF data-flow hops attached per boundary-adjacent segment (default 50, max 200). When a segment dataFlow is truncated, re-issue with a higher limit.',
+            'Cross-repo + pdg:true only: max REACHING_DEF hops per segment (default 50, max 200).',
           default: 50,
           minimum: 1,
           maximum: 200,
@@ -587,7 +490,7 @@ DESTINATION TRACE (cross-repo): for an "@groupName" trace, OMIT to/to_uid/to_fil
         repo: {
           type: 'string',
           description:
-            'Repository name or path, or "@groupName" / "@groupName/memberPath" for a cross-repo trace over a group. Omit if only one repo is indexed.',
+            'Repository name/path, or "@groupName" / "@groupName/memberPath" for cross-repo trace. Omit if only one repo indexed.',
         },
       },
       required: [],
