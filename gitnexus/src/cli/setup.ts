@@ -81,16 +81,18 @@ export function formatHookCommand(
 const CLI_PATH_SOURCE_LITERAL =
   "let cliPath = path.resolve(__dirname, '..', '..', 'dist', 'cli', 'index.js');";
 
-/** Env var used in committed MCP JSON files. setup writes it to the shell profile
- *  so the local build path is resolved at runtime via ${GITNEXUS_DIST}. */
-const GITNEXUS_DIST_ENV = 'GITNEXUS_DIST';
+/** Placeholder in committed MCP JSON files. setup replaces it with the resolved
+ *  absolute path to the local build when running from a checkout. */
+const MCP_DIST_PLACEHOLDER = '__GITNEXUS_DIST__';
 
-/** Shell profile candidates in priority order. The first writable file wins.
- *  New exports are appended; existing GITNEXUS_DIST lines are updated in-place. */
-const SHELL_PROFILE_CANDIDATES = ['.zshenv', '.zshrc', '.bash_profile', '.bashrc', '.profile'];
-
-/** Marker so we can update an existing line on re-runs instead of appending. */
-const GITNEXUS_DIST_EXPORT_PREFIX = 'export GITNEXUS_DIST=';
+/** Project MCP JSON files that carry the placeholder. */
+const PROJECT_MCP_FILES = [
+  '.mcp.json',
+  'gitnexus-claude-plugin/.mcp.json',
+  ...['cli', 'debugging', 'exploring', 'guide', 'impact-analysis', 'refactoring'].map(
+    (name) => `gitnexus-claude-plugin/skills/gitnexus-${name}/mcp.json`,
+  ),
+];
 
 interface SetupResult {
   configured: string[];
@@ -1190,73 +1192,38 @@ async function installCodexSkills(result: SetupResult): Promise<void> {
   }
 }
 
-// ─── Local-checkout Shell Env Injection ──────────────────────────
+// ─── Local-checkout MCP Path Injection ────────────────────────────
 
 /**
- * Write `export GITNEXUS_DIST=/absolute/path/to/dist/cli/index.js` into the
- * user's shell profile so the `${GITNEXUS_DIST}` references in committed MCP
- * JSON files resolve at runtime. Only active in a local checkout (same guard
- * as `getMcpEntry`). Idempotent: re-running setup updates the existing line
- * instead of appending a duplicate.
+ * Replace the `__GITNEXUS_DIST__` placeholder in project MCP JSON files with
+ * the resolved absolute path to the local build. Only active in a local
+ * checkout (same guard as `getMcpEntry`). Idempotent: if the placeholder is
+ * already resolved, the file is left untouched.
  */
-async function injectShellEnv(result: SetupResult): Promise<void> {
+async function injectMcpDistPath(result: SetupResult): Promise<void> {
   if (__dirname.includes('node_modules')) return;
 
+  const projectRoot = path.resolve(__dirname, '..', '..', '..');
   const distPath = path.resolve(__dirname, '..', '..', 'dist', 'cli', 'index.js');
-  const exportLine = `export GITNEXUS_DIST=${distPath}`;
 
-  let written = false;
-  for (const name of SHELL_PROFILE_CANDIDATES) {
-    const profilePath = path.join(os.homedir(), name);
+  let injected = 0;
+  for (const relPath of PROJECT_MCP_FILES) {
+    const filePath = path.join(projectRoot, relPath);
     try {
-      let content: string;
-      try {
-        content = await fs.readFile(profilePath, 'utf-8');
-      } catch {
-        // File doesn't exist yet — prefer the first candidate that has a
-        // parent directory (home always does), then create it below.
+      let content = await fs.readFile(filePath, 'utf-8');
+      if (!content.includes(MCP_DIST_PLACEHOLDER)) continue;
+      content = content.replace(MCP_DIST_PLACEHOLDER, distPath);
+      await fs.writeFile(filePath, content, 'utf-8');
+      injected++;
+    } catch (err) {
+      if (!isEnoent(err)) {
+        result.errors.push(`MCP path injection (${relPath}): ${(err as Error).message}`);
       }
-
-      if (content !== undefined) {
-        // Update an existing GITNEXUS_DIST line in-place; otherwise append.
-        if (content.includes(GITNEXUS_DIST_EXPORT_PREFIX)) {
-          content = content.replace(new RegExp(`^export GITNEXUS_DIST=.*$`, 'm'), exportLine);
-        } else {
-          content = `${content.trimEnd()}\n${exportLine}\n`;
-        }
-      } else {
-        content = `${exportLine}\n`;
-      }
-
-      await fs.writeFile(profilePath, content, 'utf-8');
-      result.configured.push(`Shell env (${name} ← GITNEXUS_DIST)`);
-      written = true;
-      break;
-    } catch {
-      // Permission or I/O error — try the next candidate
     }
   }
 
-  if (!written) {
-    result.errors.push(
-      `Shell env: could not write ${exportLine} to any of ${SHELL_PROFILE_CANDIDATES.join(', ')}`,
-    );
-  }
-
-  // macOS: GUI apps (including Claude Code) don't source shell profiles.
-  // `launchctl setenv` persists GITNEXUS_DIST across GUI app launches so that
-  // `${GITNEXUS_DIST}` in .mcp.json resolves correctly.
-  if (process.platform === 'darwin') {
-    try {
-      execFileSync('launchctl', ['setenv', GITNEXUS_DIST_ENV, distPath], {
-        timeout: 5000,
-        stdio: 'ignore',
-        windowsHide: true,
-      });
-      result.configured.push(`launchctl setenv (${GITNEXUS_DIST_ENV})`);
-    } catch (err: any) {
-      result.errors.push(`launchctl setenv: ${err.message}`);
-    }
+  if (injected > 0) {
+    result.configured.push(`Local MCP path injected (${injected} files → ${distPath})`);
   }
 }
 
@@ -1282,8 +1249,8 @@ export const setupCommand = async (options?: { codingAgent?: string[] | string }
     errors: [],
   };
 
-  // Inject GITNEXUS_DIST into shell profile when running from a local checkout
-  await injectShellEnv(result);
+  // Inject local build path into project MCP JSON files when running from checkout
+  await injectMcpDistPath(result);
 
   // Detect and configure each editor's MCP
   if (selected.has('cursor')) await setupCursor(result);
