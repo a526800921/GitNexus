@@ -2,7 +2,7 @@
   "mcpServers": {
     "gitnexus": {
       "command": "node",
-      "args": ["__GITNEXUS_DIST__", "mcp"]
+      "args": ["${GITNEXUS_DIST}", "mcp"]
     }
   }
 }
