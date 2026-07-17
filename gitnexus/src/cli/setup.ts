@@ -81,6 +81,19 @@ export function formatHookCommand(
 const CLI_PATH_SOURCE_LITERAL =
   "let cliPath = path.resolve(__dirname, '..', '..', 'dist', 'cli', 'index.js');";
 
+/** Placeholder injected into committed MCP JSON files. setup replaces it with the
+ *  resolved absolute path to the local build when running from a checkout. */
+const MCP_DIST_PLACEHOLDER = '__GITNEXUS_DIST__';
+
+/** Pattern: any mcp.json file directly under the project root or the plugin dir. */
+const PROJECT_MCP_FILES = [
+  '.mcp.json',
+  'gitnexus-claude-plugin/.mcp.json',
+  ...['cli', 'debugging', 'exploring', 'guide', 'impact-analysis', 'refactoring'].map(
+    (name) => `gitnexus-claude-plugin/skills/gitnexus-${name}/mcp.json`,
+  ),
+];
+
 interface SetupResult {
   configured: string[];
   skipped: string[];
@@ -1179,6 +1192,43 @@ async function installCodexSkills(result: SetupResult): Promise<void> {
   }
 }
 
+// ─── Local-checkout MCP Path Injection ────────────────────────────
+
+/**
+ * Replace the `__GITNEXUS_DIST__` placeholder in committed MCP JSON files
+ * with the resolved absolute path to the local build. Only active when
+ * running from a local checkout (same detection as `getMcpEntry`).
+ */
+async function injectLocalMcpDistPath(result: SetupResult): Promise<void> {
+  // Only relevant in a local checkout — global installs resolve via getMcpEntry
+  if (__dirname.includes('node_modules')) return;
+
+  const projectRoot = path.resolve(__dirname, '..', '..', '..');
+  const distPath = path.resolve(__dirname, '..', '..', 'dist', 'cli', 'index.js');
+
+  let injected = 0;
+  for (const relPath of PROJECT_MCP_FILES) {
+    const filePath = path.join(projectRoot, relPath);
+    try {
+      let content = await fs.readFile(filePath, 'utf-8');
+      if (!content.includes(MCP_DIST_PLACEHOLDER)) continue;
+      content = content.replace(MCP_DIST_PLACEHOLDER, distPath);
+      await fs.writeFile(filePath, content, 'utf-8');
+      injected++;
+    } catch (err) {
+      // File missing or unreadable — skip silently (not every checkout has
+      // every listed file; some skill dirs may not exist yet)
+      if (!isEnoent(err)) {
+        result.errors.push(`MCP path injection (${relPath}): ${(err as Error).message}`);
+      }
+    }
+  }
+
+  if (injected > 0) {
+    result.configured.push(`Local MCP path injected (${injected} files → ${distPath})`);
+  }
+}
+
 // ─── Main command ──────────────────────────────────────────────────
 
 export const setupCommand = async (options?: { codingAgent?: string[] | string }) => {
@@ -1200,6 +1250,9 @@ export const setupCommand = async (options?: { codingAgent?: string[] | string }
     skipped: [],
     errors: [],
   };
+
+  // Inject local build path into project MCP JSON files when running from checkout
+  await injectLocalMcpDistPath(result);
 
   // Detect and configure each editor's MCP
   if (selected.has('cursor')) await setupCursor(result);
