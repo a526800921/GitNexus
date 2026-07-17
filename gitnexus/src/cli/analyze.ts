@@ -1322,7 +1322,7 @@ const analyzeCommandImpl = async (
   try {
     const skipAll = options.indexOnly;
     const skipAgentsMd = skipAll || options.skipAgentsMd;
-    const skipSkills = skipAll || options.skipSkills;
+    const skipSkills = skipAll || options.skipSkills !== false;
     const result = await runFullAnalysis(
       repoPath,
       {
