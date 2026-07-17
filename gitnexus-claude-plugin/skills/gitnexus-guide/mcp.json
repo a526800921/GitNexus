@@ -1,8 +1,1 @@
-{
-  "mcpServers": {
-    "gitnexus": {
-      "command": "node",
-      "args": ["scripts/gitnexus-mcp.cjs", "mcp"]
-    }
-  }
-}
+{}
