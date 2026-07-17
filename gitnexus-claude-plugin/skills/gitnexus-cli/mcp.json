@@ -1,8 +1,8 @@
 {
   "mcpServers": {
     "gitnexus": {
-      "command": "node",
-      "args": ["${GITNEXUS_DIST}", "mcp"]
+      "command": "sh",
+      "args": ["-c", "exec node \"${GITNEXUS_DIST}\" mcp"]
     }
   }
 }
