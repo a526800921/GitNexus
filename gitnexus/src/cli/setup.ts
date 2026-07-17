@@ -1242,6 +1242,22 @@ async function injectShellEnv(result: SetupResult): Promise<void> {
       `Shell env: could not write ${exportLine} to any of ${SHELL_PROFILE_CANDIDATES.join(', ')}`,
     );
   }
+
+  // macOS: GUI apps (including Claude Code) don't source shell profiles.
+  // `launchctl setenv` persists GITNEXUS_DIST across GUI app launches so that
+  // `${GITNEXUS_DIST}` in .mcp.json resolves correctly.
+  if (process.platform === 'darwin') {
+    try {
+      execFileSync('launchctl', ['setenv', GITNEXUS_DIST_ENV, distPath], {
+        timeout: 5000,
+        stdio: 'ignore',
+        windowsHide: true,
+      });
+      result.configured.push(`launchctl setenv (${GITNEXUS_DIST_ENV})`);
+    } catch (err: any) {
+      result.errors.push(`launchctl setenv: ${err.message}`);
+    }
+  }
 }
 
 // ─── Main command ──────────────────────────────────────────────────
