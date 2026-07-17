@@ -81,20 +81,35 @@ export function formatHookCommand(
 const CLI_PATH_SOURCE_LITERAL =
   "let cliPath = path.resolve(__dirname, '..', '..', 'dist', 'cli', 'index.js');";
 
-/** Shell profile for alias injection. */
-const SHELL_PROFILE = process.platform === 'win32' ? null : '.zshrc';
+/**
+ * Create a `gitnexus` → `index.js` symlink in dist/cli/ and add it to PATH
+ * via the shell profile. Both terminal and editor MCP launches resolve the
+ * bare `gitnexus` command.
+ */
+async function injectCliToPath(result: SetupResult): Promise<void> {
+  if (__dirname.includes('node_modules')) return;
 
-/** Prefix marker — used to update on re-runs instead of appending a duplicate. */
-const GITNEXUS_ALIAS_PREFIX = '# gitnexus: local CLI alias';
+  const cliDir = path.resolve(__dirname, '..', '..', 'dist', 'cli');
+  const symlinkPath = path.join(cliDir, 'gitnexus');
 
-async function injectCliAlias(result: SetupResult): Promise<void> {
-  if (__dirname.includes('node_modules') || !SHELL_PROFILE) return;
+  // Create/refresh symlink: gitnexus → index.js
+  try {
+    try {
+      await fs.unlink(symlinkPath);
+    } catch {
+      /* ok if absent */
+    }
+    await fs.symlink('index.js', symlinkPath);
+  } catch (err: any) {
+    result.errors.push(`Symlink: ${err.message}`);
+    return;
+  }
 
-  const cliPath = path.resolve(__dirname, '..', '..', 'dist', 'cli', 'index.js');
-  const aliasLine = `alias gitnexus='node ${cliPath}'`;
-  const block = `${GITNEXUS_ALIAS_PREFIX}\n${aliasLine}`;
+  // Write PATH to shell profile
+  const profilePath = path.join(os.homedir(), '.zshrc');
+  const pathLine = `export PATH="${cliDir}:$PATH"`;
+  const prefix = '# gitnexus: local CLI';
 
-  const profilePath = path.join(os.homedir(), SHELL_PROFILE);
   try {
     let content: string;
     try {
@@ -103,19 +118,19 @@ async function injectCliAlias(result: SetupResult): Promise<void> {
       content = '';
     }
 
-    if (content.includes(GITNEXUS_ALIAS_PREFIX)) {
+    if (content.includes(prefix)) {
       content = content.replace(
-        new RegExp(`# gitnexus: local CLI alias\\nalias gitnexus='[^']*'`, 'm'),
-        block,
+        new RegExp(`${prefix}\\nexport PATH="[^"]*"`, 'm'),
+        `${prefix}\n${pathLine}`,
       );
     } else {
-      content = `${content.trimEnd()}\n${block}\n`;
+      content = `${content.trimEnd()}\n${prefix}\n${pathLine}\n`;
     }
 
     await fs.writeFile(profilePath, content, 'utf-8');
-    result.configured.push(`Alias (.zshrc ← gitnexus)`);
+    result.configured.push(`PATH + symlink (gitnexus → ${cliDir})`);
   } catch (err: any) {
-    result.errors.push(`Alias: ${err.message}`);
+    result.errors.push(`PATH: ${err.message}`);
   }
 }
 
@@ -205,10 +220,11 @@ function resolveGitnexusBin(): string | null {
  * >60 s, exceeding Claude Code's 30 s MCP connection timeout).
  */
 function getMcpEntry() {
-  // Local checkout: point to the local build instead of npx / global bin
+  // Local checkout: use the gitnexus symlink in dist/cli/ (created by setup).
+  // The symlink → index.js is a valid executable with a node shebang.
   if (!__dirname.includes('node_modules')) {
-    const localIndex = path.resolve(__dirname, '..', '..', 'dist', 'cli', 'index.js');
-    return { command: 'node', args: [localIndex, 'mcp'] };
+    const cli = path.resolve(__dirname, '..', '..', 'dist', 'cli', 'gitnexus');
+    return { command: cli, args: ['mcp'] };
   }
 
   const bin = resolveGitnexusBin();
@@ -237,8 +253,8 @@ function getMcpEntry() {
 function getOpenCodeMcpEntry() {
   // Local checkout: point to the local build
   if (!__dirname.includes('node_modules')) {
-    const localIndex = path.resolve(__dirname, '..', '..', 'dist', 'cli', 'index.js');
-    return { type: 'local', command: ['node', localIndex, 'mcp'] };
+    const cli = path.resolve(__dirname, '..', '..', 'dist', 'cli', 'gitnexus');
+    return { type: 'local', command: [cli, 'mcp'] };
   }
 
   const bin = resolveGitnexusBin();
@@ -1239,8 +1255,8 @@ export const setupCommand = async (options?: { codingAgent?: string[] | string }
     errors: [],
   };
 
-  // Register local CLI alias when running from a checkout
-  await injectCliAlias(result);
+  // Register local CLI on PATH when running from a checkout
+  await injectCliToPath(result);
 
   // Detect and configure each editor's MCP
   if (selected.has('cursor')) await setupCursor(result);
