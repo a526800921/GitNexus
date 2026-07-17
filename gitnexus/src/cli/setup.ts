@@ -105,8 +105,9 @@ async function injectCliToPath(result: SetupResult): Promise<void> {
     return;
   }
 
-  // Write PATH to shell profile
-  const profilePath = path.join(os.homedir(), '.zshrc');
+  // Write PATH to .zshenv — sourced by all zsh instances (interactive + non-),
+  // so both terminal and editor MCP launches pick it up.
+  const profilePath = path.join(os.homedir(), '.zshenv');
   const pathLine = `export PATH="${cliDir}:$PATH"`;
   const prefix = '# gitnexus: local CLI';
 
@@ -220,11 +221,9 @@ function resolveGitnexusBin(): string | null {
  * >60 s, exceeding Claude Code's 30 s MCP connection timeout).
  */
 function getMcpEntry() {
-  // Local checkout: use the gitnexus symlink in dist/cli/ (created by setup).
-  // The symlink → index.js is a valid executable with a node shebang.
+  // Local checkout: the gitnexus symlink is on PATH (setup writes it).
   if (!__dirname.includes('node_modules')) {
-    const cli = path.resolve(__dirname, '..', '..', 'dist', 'cli', 'gitnexus');
-    return { command: cli, args: ['mcp'] };
+    return { command: 'gitnexus', args: ['mcp'] };
   }
 
   const bin = resolveGitnexusBin();
@@ -251,10 +250,9 @@ function getMcpEntry() {
  * where command is a flat array (command + args combined).
  */
 function getOpenCodeMcpEntry() {
-  // Local checkout: point to the local build
+  // Local checkout: gitnexus is on PATH from setup
   if (!__dirname.includes('node_modules')) {
-    const cli = path.resolve(__dirname, '..', '..', 'dist', 'cli', 'gitnexus');
-    return { type: 'local', command: [cli, 'mcp'] };
+    return { type: 'local', command: ['gitnexus', 'mcp'] };
   }
 
   const bin = resolveGitnexusBin();
