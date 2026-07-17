@@ -1824,7 +1824,7 @@ const analyzeCommandImpl = async (
           `    1. Clear the npm cache:    npm cache clean --force\n` +
           `    2. Update npm:             npm install -g npm@latest\n` +
           `    3. Reinstall gitnexus:     npm install -g gitnexus@latest\n` +
-          `    4. Or try npx directly:    npx gitnexus@latest analyze\n`,
+          `    4. Or run directly:        gitnexus analyze\n`,
         { recoveryHint: 'npm-resolution' },
       );
     } else if (
@@ -1835,8 +1835,8 @@ const analyzeCommandImpl = async (
       cliError(
         `  A required module could not be loaded. The installation may be corrupt.\n` +
           `  Suggestions:\n` +
-          `    1. Reinstall:   npm install -g gitnexus@latest\n` +
-          `    2. Clear cache: npm cache clean --force && npx gitnexus@latest analyze\n`,
+          `    1. Rebuild:     npm run build\n` +
+          `    2. Retry:       gitnexus analyze\n`,
         { recoveryHint: 'module-not-found' },
       );
     }
