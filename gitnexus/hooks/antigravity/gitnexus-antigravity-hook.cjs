@@ -310,13 +310,11 @@ function runGitNexusCli(cliPath, args, cwd, timeout) {
           '-k',
           '1',
           String(Math.ceil((timeout + 5000) / 1000) + 1),
-          'npx',
-          '-y',
           'gitnexus',
           ...args,
         ],
       ]
-    : [isWin ? 'npx.cmd' : 'npx', ['-y', 'gitnexus', ...args]];
+    : [isWin ? 'gitnexus.cmd' : 'gitnexus', args];
   return spawnSync(cmd, cmdArgs, {
     encoding: 'utf-8',
     timeout: timeout + 5000,

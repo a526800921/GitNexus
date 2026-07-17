@@ -347,7 +347,7 @@ function getCmdlineMaxBytes() {
 // launcher/runtime basenames in case a future build does not rename the thread.
 // Conservative by design: over-collecting a few extra candidates only costs a
 // bounded number of Phase 1 cmdline reads.
-const COMM_CANDIDATES = ['node', 'gitnexus', 'bun', 'deno', 'npm', 'npx', 'MainThread'];
+const COMM_CANDIDATES = ['node', 'gitnexus', 'bun', 'deno', 'npm', 'MainThread'];
 function commLooksLikeServer(comm) {
   const c = comm.trim();
   if (!c) return false;

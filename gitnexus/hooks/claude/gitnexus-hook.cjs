@@ -320,10 +320,7 @@ function runGitNexusCli(cliPath, args, cwd, timeout) {
       windowsHide: true,
     });
   }
-  // On Windows, invoke npx.cmd directly (no shell needed). A non-null guard
-  // implies non-Windows, so the wrapped arm can hardcode plain `npx`. The
-  // wrapped arm leads with `-s KILL` (NOT TERM-first like the direct branch
-  // above): the CLI here is a grandchild behind npx — see the docblock.
+  // Last resort: use bare gitnexus on PATH (set by setup).
   const [cmd, cmdArgs] = guard
     ? [
         guard,
@@ -333,13 +330,11 @@ function runGitNexusCli(cliPath, args, cwd, timeout) {
           '-k',
           '1',
           String(Math.ceil((timeout + 5000) / 1000) + 1),
-          'npx',
-          '-y',
           'gitnexus',
           ...args,
         ],
       ]
-    : [isWin ? 'npx.cmd' : 'npx', ['-y', 'gitnexus', ...args]];
+    : [isWin ? 'gitnexus.cmd' : 'gitnexus', args];
   return spawnSync(cmd, cmdArgs, {
     encoding: 'utf-8',
     timeout: timeout + 5000,

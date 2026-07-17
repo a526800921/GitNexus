@@ -251,7 +251,7 @@ function formatAnalyzeCommand(options = {}, deps = {}) {
   const mode = resolveInvocationMode(probe, resolved);
   if (mode === 'gitnexus') return `gitnexus analyze${suffix}`;
   if (mode === 'pnpm') return `${formatPnpmDlxCommand(`analyze${suffix}`, options, resolved)}`;
-  return `npx ${NPX_REF} analyze${suffix}`;
+  return `gitnexus analyze${suffix}`;
 }
 
 /**
@@ -273,7 +273,7 @@ function buildRunnerArgv(mode, gitnexusArgs, deps = {}) {
       args: [...formatPnpmAllowBuildArgs({ embeddings }, deps), 'dlx', NPX_REF, ...gitnexusArgs],
     };
   }
-  return { program: 'npx', args: [NPX_REF, ...gitnexusArgs] };
+  return { program: 'gitnexus', args: [...gitnexusArgs] };
 }
 
 module.exports = {
