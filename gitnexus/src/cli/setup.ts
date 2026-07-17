@@ -81,6 +81,44 @@ export function formatHookCommand(
 const CLI_PATH_SOURCE_LITERAL =
   "let cliPath = path.resolve(__dirname, '..', '..', 'dist', 'cli', 'index.js');";
 
+/** Shell profile for alias injection. */
+const SHELL_PROFILE = process.platform === 'win32' ? null : '.zshrc';
+
+/** Prefix marker — used to update on re-runs instead of appending a duplicate. */
+const GITNEXUS_ALIAS_PREFIX = '# gitnexus: local CLI alias';
+
+async function injectCliAlias(result: SetupResult): Promise<void> {
+  if (__dirname.includes('node_modules') || !SHELL_PROFILE) return;
+
+  const cliPath = path.resolve(__dirname, '..', '..', 'dist', 'cli', 'index.js');
+  const aliasLine = `alias gitnexus='node ${cliPath}'`;
+  const block = `${GITNEXUS_ALIAS_PREFIX}\n${aliasLine}`;
+
+  const profilePath = path.join(os.homedir(), SHELL_PROFILE);
+  try {
+    let content: string;
+    try {
+      content = await fs.readFile(profilePath, 'utf-8');
+    } catch {
+      content = '';
+    }
+
+    if (content.includes(GITNEXUS_ALIAS_PREFIX)) {
+      content = content.replace(
+        new RegExp(`# gitnexus: local CLI alias\\nalias gitnexus='[^']*'`, 'm'),
+        block,
+      );
+    } else {
+      content = `${content.trimEnd()}\n${block}\n`;
+    }
+
+    await fs.writeFile(profilePath, content, 'utf-8');
+    result.configured.push(`Alias (.zshrc ← gitnexus)`);
+  } catch (err: any) {
+    result.errors.push(`Alias: ${err.message}`);
+  }
+}
+
 interface SetupResult {
   configured: string[];
   skipped: string[];
@@ -1200,6 +1238,9 @@ export const setupCommand = async (options?: { codingAgent?: string[] | string }
     skipped: [],
     errors: [],
   };
+
+  // Register local CLI alias when running from a checkout
+  await injectCliAlias(result);
 
   // Detect and configure each editor's MCP
   if (selected.has('cursor')) await setupCursor(result);

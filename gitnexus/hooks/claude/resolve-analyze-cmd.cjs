@@ -299,7 +299,23 @@ module.exports = {
 // script.
 if (require.main === module) {
   const gitnexusArgs = process.argv.slice(2);
-  const { program, args } = buildRunnerArgv(resolveInvocationMode(), gitnexusArgs);
+  let mode = resolveInvocationMode();
+
+  // Local checkout fallback: when no runner is on PATH, use the monorepo dist
+  // directly so developers don't need a global install.
+  if (mode === 'gitnexus' && !resolveOnPath('gitnexus', true)) {
+    const localDist = path.resolve(__dirname, '..', 'gitnexus', 'dist', 'cli', 'index.js');
+    if (fs.existsSync(localDist)) {
+      try {
+        execFileSync('node', [localDist, ...gitnexusArgs], { stdio: 'inherit' });
+      } catch (err) {
+        process.exit(typeof err.status === 'number' ? err.status : 1);
+      }
+      return;
+    }
+  }
+
+  const { program, args } = buildRunnerArgv(mode, gitnexusArgs);
   try {
     execFileSync(program, args, {
       stdio: 'inherit',
