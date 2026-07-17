@@ -180,15 +180,10 @@ export function generateGitNexusContent(
 |------|---------------------|
 ${tableBody}`
     : '';
-  // Docs reference the project-local runner `gitnexus analyze` writes (#1945):
-  // a single, CLI-neutral, machine-independent command (no per-machine churn,
-  // #1706) that auto-selects the available runner at call time. Kept terse to
-  // stay under the CLAUDE.md block token budget (#856); the cli skill carries the
-  // full bootstrap + npm-11 fallback (`node.target is null` npx install crash).
+  // Docs reference the local CLI. Kept terse to stay under the CLAUDE.md
+  // block token budget (#856); the cli skill carries the full bootstrap.
   const runner = `node ${runnerPath}`;
-  const bootstrapNote =
-    `No \`${runnerPath}\` yet? \`npx gitnexus analyze\` ` +
-    '(npm 11 crash → `npm i -g gitnexus`; #1939).';
+  const bootstrapNote = `No \`${runnerPath}\` yet? Run \`gitnexus analyze\`.`;
 
   return `${GITNEXUS_START_MARKER}
 # GitNexus — Code Intelligence
