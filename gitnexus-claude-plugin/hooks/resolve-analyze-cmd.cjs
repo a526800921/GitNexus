@@ -202,14 +202,13 @@ function resolveInvocationMode(probe = resolveOnPath, deps = {}) {
         ? deps.pnpmMajor !== null
         : Boolean(probe('pnpm'));
 
-  // npm 11+ npx install crash (#1939) — prefer pnpm dlx when available.
-  if (hasPnpm && npmMajor !== null && npmMajor >= 11) return 'pnpm';
-  // npm 10 and earlier: npx works; prefer it over pnpm dlx when npm is present.
-  if (npmMajor !== null && npmMajor < 11) return 'npx';
+  // npm present — prefer pnpm dlx when available.
+  if (hasPnpm && npmMajor !== null) return 'pnpm';
   // npm absent or unreadable — use pnpm if present (with allow-build flags).
   if (hasPnpm) return 'pnpm';
 
-  return 'npx';
+  // No runner available — fail with a clear message.
+  return 'gitnexus';
 }
 
 function formatPnpmDlxCommand(gitnexusArgs, options = {}, deps = {}) {
