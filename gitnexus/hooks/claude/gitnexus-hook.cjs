@@ -13,7 +13,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { spawnSync } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const { acquireHookSlot } = require('./hook-lock.cjs');
 const {
   hasGitNexusDbLockedByGitNexusServer,
@@ -524,6 +524,17 @@ function handlePostToolUse(input) {
     `GitNexus index is stale (last indexed: ${lastCommit ? lastCommit.slice(0, 7) : 'never'}). ` +
       `Run \`${analyzeCmd}\` to update the knowledge graph.`,
   );
+
+  // Fire-and-forget: spawn gitnexus analyze to update the index automatically
+  const cliPath = resolveCliPath();
+  if (cliPath) {
+    const child = spawn(process.execPath, [cliPath, 'analyze'], {
+      stdio: 'ignore',
+      detached: true,
+      cwd,
+    });
+    child.unref();
+  }
 }
 
 // Dispatch map for hook events

@@ -650,32 +650,32 @@ async function installClaudeSchemaHooks(
         },
       });
     }
-    // 精简版: 跳过 PostToolUse hook（索引新鲜度检查）
-    // if (!hasGitnexusHook(parsed?.hooks, 'PostToolUse', hookCfg.needle)) {
-    //   hookEntries.push({
-    //     eventName: 'PostToolUse',
-    //     value: {
-    //       matcher: 'Bash',
-    //       hooks: [
-    //         {
-    //           type: 'command',
-    //           command: hookCmd,
-    //           timeout: 10,
-    //           statusMessage: 'Checking GitNexus index freshness...',
-    //         },
-    //       ],
-    //     },
-    //   });
-    // }
+    if (!hasGitnexusHook(parsed?.hooks, 'PostToolUse', hookCfg.needle)) {
+      hookEntries.push({
+        eventName: 'PostToolUse',
+        value: {
+          matcher: 'Bash',
+          hooks: [
+            {
+              type: 'command',
+              command: hookCmd,
+              timeout: 10,
+              statusMessage: 'Updating GitNexus index...',
+            },
+          ],
+        },
+      });
+    }
 
     if (hookEntries.length === 0) {
       result.configured.push(`${label} (already configured)`);
       return;
     }
 
+    const eventNames = hookEntries.map((e) => e.eventName).join(', ');
     const ok = await mergeHooksJsonc(settingsPath, hookEntries);
     if (ok) {
-      result.configured.push(`${label} (PreToolUse)`);
+      result.configured.push(`${label} (${eventNames})`);
     } else {
       result.errors.push(
         `${label}: ${path.basename(settingsPath)} is corrupt — skipping to preserve existing content`,
