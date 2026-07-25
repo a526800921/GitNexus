@@ -4,8 +4,8 @@
  *
  * PreToolUse  — intercepts Grep/Glob/Bash searches and augments
  *               with graph context from the GitNexus index.
- * PostToolUse — detects stale index after git mutations and notifies
- *               the agent to reindex.
+ * PostToolUse — detects stale index after git mutations and
+ *               auto-reindexes silently in the background.
  *
  * NOTE: SessionStart hooks are broken on Windows (Claude Code bug).
  * Session context is injected via CLAUDE.md / skills instead.
@@ -19,7 +19,6 @@ const {
   hasGitNexusDbLockedByGitNexusServer,
   resolveUnixGuardTimeout,
 } = require('./hook-db-lock-probe.cjs');
-const { formatAnalyzeCommand } = require('./resolve-analyze-cmd.cjs');
 
 /**
  * Read JSON input from stdin synchronously.
@@ -468,11 +467,9 @@ function sendHookResponse(hookEventName, message) {
 /**
  * PostToolUse handler — detect index staleness after git mutations.
  *
- * Instead of spawning a full `gitnexus analyze` synchronously (which blocks
- * the agent for up to 120s and risks KuzuDB corruption on timeout), we do a
- * lightweight staleness check: compare `git rev-parse HEAD` against the
- * lastCommit stored in `.gitnexus/meta.json`. If they differ, notify the
- * agent so it can decide when to reindex.
+ * Compares `git rev-parse HEAD` against the lastCommit stored in
+ * `.gitnexus/meta.json`. If they differ, fire-and-forget spawns
+ * `gitnexus analyze` to update the index silently.
  */
 function handlePostToolUse(input) {
   const toolName = input.tool_name || '';
@@ -508,22 +505,13 @@ function handlePostToolUse(input) {
   if (!currentHead) return;
 
   let lastCommit = '';
-  let hadEmbeddings = false;
   const meta = readIndexMeta(gitNexusDir);
   if (meta) {
     lastCommit = meta.lastCommit || '';
-    hadEmbeddings = meta.stats && meta.stats.embeddings > 0;
   }
 
   // If HEAD matches last indexed commit, no reindex needed
   if (currentHead && currentHead === lastCommit) return;
-
-  const analyzeCmd = formatAnalyzeCommand({ embeddings: hadEmbeddings });
-  sendHookResponse(
-    'PostToolUse',
-    `GitNexus index is stale (last indexed: ${lastCommit ? lastCommit.slice(0, 7) : 'never'}). ` +
-      `Run \`${analyzeCmd}\` to update the knowledge graph.`,
-  );
 
   // Fire-and-forget: spawn gitnexus analyze to update the index automatically
   const cliPath = resolveCliPath();

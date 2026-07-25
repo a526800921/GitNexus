@@ -660,7 +660,6 @@ async function installClaudeSchemaHooks(
               type: 'command',
               command: hookCmd,
               timeout: 10,
-              statusMessage: 'Updating GitNexus index...',
             },
           ],
         },
