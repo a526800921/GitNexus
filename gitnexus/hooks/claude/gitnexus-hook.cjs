@@ -4,8 +4,8 @@
  *
  * PreToolUse  — intercepts Grep/Glob/Bash searches and augments
  *               with graph context from the GitNexus index.
- * PostToolUse — detects stale index after git mutations and notifies
- *               the agent to reindex.
+ * PostToolUse — detects stale index after git mutations and starts a
+ *               background index-only analyze.
  *
  * NOTE: SessionStart hooks are broken on Windows (Claude Code bug).
  * Session context is injected via CLAUDE.md / skills instead.
@@ -13,7 +13,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { spawnSync } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const { acquireHookSlot } = require('./hook-lock.cjs');
 const {
   hasGitNexusDbLockedByGitNexusServer,
@@ -377,14 +377,35 @@ function sendHookResponse(hookEventName, message) {
   );
 }
 
+/** Start an index-only analyze without blocking the PostToolUse Hook. */
+function spawnBackgroundAnalyze(cwd) {
+  const cliPath = resolveCliPath();
+  if (!cliPath) return false;
+
+  try {
+    const child = spawn(process.execPath, [cliPath, 'analyze', '--index-only'], {
+      stdio: 'ignore',
+      detached: true,
+      cwd,
+      windowsHide: true,
+    });
+    // A missing or unusable CLI must not turn a successful PostToolUse hook
+    // into an uncaught ChildProcess error.
+    child.on('error', () => {});
+    child.unref();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * PostToolUse handler — detect index staleness after git mutations.
  *
- * Instead of spawning a full `gitnexus analyze` synchronously (which blocks
- * the agent for up to 120s and risks KuzuDB corruption on timeout), we do a
- * lightweight staleness check: compare `git rev-parse HEAD` against the
- * lastCommit stored in the registered index metadata. If they differ, notify the
- * agent so it can decide when to reindex.
+ * The staleness check stays synchronous and lightweight: compare `git rev-parse
+ * HEAD` against the lastCommit stored in the registered index metadata. If they
+ * differ, start an index-only analyze in a detached child so the Hook returns
+ * immediately while the index catches up in the background.
  */
 function handlePostToolUse(input) {
   const toolName = input.tool_name || '';
@@ -430,11 +451,13 @@ function handlePostToolUse(input) {
   // If HEAD matches last indexed commit, no reindex needed
   if (currentHead && currentHead === lastCommit) return;
 
+  const started = spawnBackgroundAnalyze(cwd);
   const analyzeCmd = formatAnalyzeCommand({ embeddings: hadEmbeddings, indexOnly: true });
   sendHookResponse(
     'PostToolUse',
     `GitNexus index is stale (last indexed: ${lastCommit ? lastCommit.slice(0, 7) : 'never'}). ` +
-      `Run \`${analyzeCmd}\` to update the knowledge graph.`,
+      `${started ? 'Background reindex started.' : 'Background reindex could not start.'} ` +
+      `Run \`${analyzeCmd}\` manually if needed.`,
   );
 }
 

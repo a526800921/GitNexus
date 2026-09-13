@@ -14,7 +14,9 @@ import {
   runHook as spawnHook,
   parseHookOutput,
   createGitNexusPathEntry,
+  createHookToolDir,
   envWithPath,
+  hookEnv,
 } from '../utils/hook-test-helpers.js';
 import { commitAll, initGitRepo } from '../helpers/temp-git-repo.js';
 
@@ -112,6 +114,51 @@ describe.each(HOOKS)('hooks e2e ($name)', ({ name, path: hookPath }) => {
       expect(output).not.toBeNull();
       expect(output!.additionalContext).toContain('stale');
       expect(output!.additionalContext).toContain('npx gitnexus@latest analyze');
+    });
+
+    it('starts a detached index-only analyze after detecting staleness', async () => {
+      fs.writeFileSync(
+        path.join(gitNexusDir, 'meta.json'),
+        JSON.stringify({ lastCommit: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', stats: {} }),
+      );
+      const markerPath = path.join(os.tmpdir(), `hooks-e2e-analyze-${process.pid}-${name}`);
+      const argsPath = path.join(os.tmpdir(), `hooks-e2e-analyze-args-${process.pid}-${name}`);
+      fs.rmSync(markerPath, { force: true });
+      fs.rmSync(argsPath, { force: true });
+      const binDir = createHookToolDir({
+        gitnexusMarkerPath: markerPath,
+        gitnexusArgsPath: argsPath,
+      });
+
+      try {
+        const result = runHook(
+          hookPath,
+          {
+            hook_event_name: 'PostToolUse',
+            tool_name: 'Bash',
+            tool_input: { command: 'git commit -m "test"' },
+            tool_output: { exit_code: 0 },
+            cwd: tmpDir,
+          },
+          tmpDir,
+          { env: hookEnv(binDir) },
+        );
+
+        const output = parseHookOutput(result.stdout);
+        expect(output).not.toBeNull();
+        expect(output!.additionalContext).toContain('Background reindex started.');
+
+        const deadline = Date.now() + 5000;
+        while (!fs.existsSync(argsPath) && Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        expect(fs.existsSync(markerPath)).toBe(true);
+        expect(JSON.parse(fs.readFileSync(argsPath, 'utf-8'))).toEqual(['analyze', '--index-only']);
+      } finally {
+        fs.rmSync(markerPath, { force: true });
+        fs.rmSync(argsPath, { force: true });
+        fs.rmSync(binDir, { recursive: true, force: true });
+      }
     });
 
     it('prefers pnpm dlx when GITNEXUS_INVOCATION=pnpm', () => {

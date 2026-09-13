@@ -100,6 +100,8 @@ function writeImmediateShellExecutable(filePath: string, stdout: string, markerP
 export function createHookToolDir(options: {
   gitnexusStderr?: string;
   gitnexusMarkerPath?: string;
+  /** Fake gitnexus CLI writes process.argv.slice(2) as JSON to this path. */
+  gitnexusArgsPath?: string;
   /** Fake gitnexus CLI writes its own PID here as its FIRST statement, minimizing detection latency for augment orphan-reaping tests (#2163 follow-up). */
   gitnexusPidFile?: string;
   /** Fake gitnexus CLI sleeps this long instead of exiting — models a hung augment child. */
@@ -121,6 +123,7 @@ export function createHookToolDir(options: {
   const binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gitnexus-hook-bin-'));
   const gitnexusStderr = JSON.stringify(options.gitnexusStderr ?? '');
   const markerPath = JSON.stringify(options.gitnexusMarkerPath ?? '');
+  const argsPath = JSON.stringify(options.gitnexusArgsPath ?? '');
 
   // Composable prologue (mirrors the fake-lsof one below): pidFile write MUST
   // stay the first statement (see the option docs above); the SIGTERM trap
@@ -132,6 +135,7 @@ export function createHookToolDir(options: {
       : '') +
     (options.gitnexusIgnoreSigterm ? `process.on('SIGTERM', () => {});\n` : '') +
     `const marker = ${markerPath};\nif (marker) fs.writeFileSync(marker, 'called');\n` +
+    `const argsPath = ${argsPath};\nif (argsPath) fs.writeFileSync(argsPath, JSON.stringify(process.argv.slice(2)));\n` +
     (options.gitnexusSleepMs != null
       ? `setTimeout(() => {}, ${Number(options.gitnexusSleepMs)});\n`
       : `process.stderr.write(${gitnexusStderr});\n`);

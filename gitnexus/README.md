@@ -49,7 +49,7 @@ To configure MCP for your editor, run `npx gitnexus setup` once — or set it up
 | **Qoder** (Alibaba)      | Yes | Yes    | —                                                                                          | MCP + Skills |
 | **Windsurf**             | Yes | —      | —                                                                                          | MCP          |
 
-> **Claude Code** and **Codex** get the deepest integration: MCP tools + agent skills + PreToolUse hooks that automatically enrich grep/glob/bash calls with knowledge graph context + PostToolUse hooks that detect a stale index after commits and prompt the agent to reindex.
+> **Claude Code** and **Codex** get the deepest integration: MCP tools + agent skills + PreToolUse hooks that automatically enrich grep/glob/bash calls with knowledge graph context + PostToolUse hooks that detect a stale index after commits and start a detached `analyze --index-only` in the background.
 
 ### Community Integrations
 
