@@ -1,94 +1,16 @@
 ---
 name: gitnexus-impact-analysis
-description: Analyze blast radius before making code changes
+description: "Assess dependents and compatibility risks of proposed or existing code changes with GitNexus."
 ---
 
 # Impact Analysis with GitNexus
 
-## When to Use
-- "Is it safe to change this function?"
-- "What will break if I modify X?"
-- "Show me the blast radius"
-- "Who uses this code?"
-- Before making non-trivial code changes
-- Before committing — to understand what your changes affect
+Assess which dependents need review for the proposed change.
 
-## Workflow
+- Resolve the target repository and symbol; use a UID or file hint when ambiguous.
+- Run `impact({target, direction: "upstream", repo})`. For hub symbols, request `summaryOnly: true` before expanding relevant results. Inspect source at affected callers to assess compatibility.
+- Direct dependencies are review candidates, not proof of breakage. Report the tool's risk separately from confirmed defects; disclose filtered or truncated results. Test references do not establish behavioral coverage.
+- Use `detect_changes` for an existing diff, with the scope and base matching that diff. Read additional processes only when needed to explain an affected behavior.
+- If tools or a current index are unavailable, use source/text inspection and state the limitation. For a stale index, run `node .gitnexus/run.cjs analyze` only within existing authorization.
 
-```
-1. impact({target: "X", direction: "upstream"})  → What depends on this
-2. READ gitnexus://repo/{name}/processes                   → Check affected execution flows
-3. detect_changes()                               → Map current git changes to affected flows
-4. Assess risk and report to user
-```
-
-> If "Index is stale" → run `node .gitnexus/run.cjs analyze` in terminal.
-
-## Checklist
-
-```
-- [ ] impact({target, direction: "upstream"}) to find dependents
-- [ ] Review d=1 items first (these WILL BREAK)
-- [ ] Check high-confidence (>0.8) dependencies
-- [ ] READ processes to check affected execution flows
-- [ ] detect_changes() for pre-commit check
-- [ ] Assess risk level and report to user
-```
-
-## Understanding Output
-
-| Depth | Risk Level | Meaning |
-|-------|-----------|---------|
-| d=1 | **WILL BREAK** | Direct callers/importers |
-| d=2 | LIKELY AFFECTED | Indirect dependencies |
-| d=3 | MAY NEED TESTING | Transitive effects |
-
-## Risk Assessment
-
-| Affected | Risk |
-|----------|------|
-| <5 symbols, few processes | LOW |
-| 5-15 symbols, 2-5 processes | MEDIUM |
-| >15 symbols or many processes | HIGH |
-| Critical path (auth, payments) | CRITICAL |
-
-## Tools
-
-**impact** — the primary tool for symbol blast radius:
-```
-impact({
-  target: "validateUser",
-  direction: "upstream",
-  minConfidence: 0.8,
-  maxDepth: 3
-})
-
-→ d=1 (WILL BREAK):
-  - loginHandler (src/auth/login.ts:42) [CALLS, 100%]
-  - apiMiddleware (src/api/middleware.ts:15) [CALLS, 100%]
-
-→ d=2 (LIKELY AFFECTED):
-  - authRouter (src/routes/auth.ts:22) [CALLS, 95%]
-```
-
-**detect_changes** — git-diff based impact analysis:
-```
-detect_changes({scope: "staged"})
-
-→ Changed: 5 symbols in 3 files
-→ Affected: LoginFlow, TokenRefresh, APIMiddlewarePipeline
-→ Risk: MEDIUM
-```
-
-## Example: "What breaks if I change validateUser?"
-
-```
-1. impact({target: "validateUser", direction: "upstream"})
-   → d=1: loginHandler, apiMiddleware (WILL BREAK)
-   → d=2: authRouter, sessionManager (LIKELY AFFECTED)
-
-2. READ gitnexus://repo/my-app/processes
-   → LoginFlow and TokenRefresh touch validateUser
-
-3. Risk: 2 direct callers, 2 processes = MEDIUM
-```
+Return affected callers/flows, compatibility evidence, and relevant validation needs. Follow project requirements for HIGH/CRITICAL risk before edits.

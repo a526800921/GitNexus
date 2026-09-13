@@ -1,88 +1,26 @@
 ---
 name: gitnexus-cli
-description: "Use when the user needs to run GitNexus CLI commands like analyze/index a repo, check status, clean the index, generate a wiki, or list indexed repos. Examples: \"Index this repo\", \"Reanalyze the codebase\", \"Generate a wiki\""
+description: "Run GitNexus CLI operations: index, status, list, clean, and wiki."
 ---
 
 # GitNexus CLI Commands
 
-Commands below use `gitnexus <command>` directly. The CLI is available after running `gitnexus setup`.
+Run commands from the target repository. Use `node .gitnexus/run.cjs` when present; it selects an available runner. If absent, use an already installed `gitnexus` executable. Check `<command> --help` for current flags instead of assuming defaults.
 
-> **Not analyzed yet?** Run `gitnexus analyze` from the project root.
+| Operation | Command | Effect |
+| --- | --- | --- |
+| Inspect index | `node .gitnexus/run.cjs status` | Read freshness/status |
+| Discover repos | `node .gitnexus/run.cjs list` | Read registered repositories |
+| Build/refresh | `node .gitnexus/run.cjs analyze` | Write index and agent context/skills |
+| Remove index | `node .gitnexus/run.cjs clean` | Delete index/unregister repository |
+| Generate docs | `node .gitnexus/run.cjs wiki` | Write documentation using an LLM |
 
-## Commands
+For a missing runner and CLI, installation is a separate action requiring authorization. Bootstrap fallback (#1939): an authorized `npm install -g gitnexus` can avoid the npm-11 npx install crash. With pnpm already available, an authorized alternative is `pnpm --allow-build=@ladybugdb/core --allow-build=gitnexus --allow-build=tree-sitter dlx gitnexus analyze`; build flags precede `dlx`. Do not install tools merely to answer a read-only question.
 
-### analyze — Build or refresh the index
+For analyze, plain runs preserve existing embeddings. `--embeddings` generates embeddings for new/changed nodes; `--drop-embeddings` explicitly discards them. `--force` requests a full rebuild; `--pdg` enables program-dependence analysis. A stale index alone does not grant permission to rewrite it.
 
-```bash
-node .gitnexus/run.cjs analyze
-```
+For clean, keep the target explicit: `--all` broadens deletion to every registered repository and `--force` skips the CLI confirmation. Use only when that deletion scope is authorized, not as routine troubleshooting.
 
-Run from the project root. This parses all source files, builds the knowledge graph, writes it to `.gitnexus/`, and generates CLAUDE.md / AGENTS.md context files.
+For wiki, use a named model when reproducibility matters and existing credential configuration without exposing secrets. `--gist` publishes publicly and requires explicit publication authorization.
 
-| Flag | Effect |
-|------|--------|
-| `--force` | Force full re-index even if up to date |
-| `--embeddings` | Enable embedding generation for semantic search (off by default) |
-| `--drop-embeddings` | Drop existing embeddings on rebuild. By default, an `analyze` without `--embeddings` preserves them. |
-| `--pdg` | Build the program-dependence layers used by `explain` and `pdg_query` (taint, CDG, and REACHING_DEF). |
-
-**When to run:** First time in a project, after major code changes, or when `gitnexus://repo/{name}/context` reports the index is stale.
-
-### status — Check index freshness
-
-```bash
-node .gitnexus/run.cjs status
-```
-
-Shows whether the current repo has a GitNexus index, when it was last updated, and symbol/relationship counts. Use this to check if re-indexing is needed.
-
-### clean — Delete the index
-
-```bash
-node .gitnexus/run.cjs clean
-```
-
-Deletes the `.gitnexus/` directory and unregisters the repo from the global registry. Use before re-indexing if the index is corrupt or after removing GitNexus from a project.
-
-| Flag | Effect |
-|------|--------|
-| `--force` | Skip confirmation prompt |
-| `--all` | Clean all indexed repos, not just the current one |
-
-### wiki — Generate documentation from the graph
-
-```bash
-node .gitnexus/run.cjs wiki
-```
-
-Generates repository documentation from the knowledge graph using an LLM. Requires an API key (saved to `~/.gitnexus/config.json` on first use).
-
-| Flag | Effect |
-|------|--------|
-| `--force` | Force full regeneration, also required to re-gerenate an existing wiki in a different language |
-| `--model <model>` | LLM model (default: minimax/minimax-m2.5) |
-| `--base-url <url>` | LLM API base URL |
-| `--api-key <key>` | LLM API key |
-| `--concurrency <n>` | Parallel LLM calls (default: 3) |
-| `--gist` | Publish wiki as a public GitHub Gist |
-| `--timeout <seconds>` | LLM request timeout in seconds (default: disabled) |
-| `--retries <n>` | Max LLM retry attempts per request (default: 3) |
-| `--lang <lang>`  | Output language for generated documentation (e.g. english, chinese, spanish, japanese)|
-### list — Show all indexed repos
-
-```bash
-node .gitnexus/run.cjs list
-```
-
-Lists all repositories registered in `~/.gitnexus/registry.json`. The MCP `list_repos` tool provides the same information.
-
-## After Indexing
-
-1. **Read `gitnexus://repo/{name}/context`** to verify the index loaded
-2. Use the other GitNexus skills (`exploring`, `debugging`, `impact-analysis`, `refactoring`) for your task
-
-## Troubleshooting
-
-- **"Not inside a git repository"**: Run from a directory inside a git repo
-- **Index is stale after re-analyzing**: Restart Claude Code to reload the MCP server
-- **Embeddings slow**: Omit `--embeddings` (it's off by default) or set `OPENAI_API_KEY` for faster API-based embedding
+After an index operation, verify status or the repository context resource. If it fails, diagnose the reported error before escalating to force rebuild, deletion, installation, or restarting processes.

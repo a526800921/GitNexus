@@ -1,113 +1,17 @@
 ---
 name: gitnexus-refactoring
-description: Plan safe refactors using blast radius and dependency mapping
+description: "Plan and perform symbol renames, moves, extractions, and splits with GitNexus impact checks."
 ---
 
 # Refactoring with GitNexus
 
-## When to Use
-- "Rename this function safely"
-- "Extract this into a module"
-- "Split this service"
-- "Move this to a new file"
-- Any task involving renaming, extracting, splitting, or restructuring code
+Preserve behavior while making the requested structural change.
 
-## Workflow
+- Resolve the repository and symbol, then run upstream `impact` before editing it. Use `context` as needed to understand interfaces and references. Follow project requirements for HIGH/CRITICAL risk.
+- For renames, use `rename` with `dry_run: true`. Review both graph and text-search edits; apply with `dry_run: false` only within the user's authorized scope. Do not substitute blind find-and-replace.
+- For extraction, splitting, or moving, define the new boundary and update affected implementations, imports, callers, and tests together.
+- Search source/config text for string-based and dynamic references that the graph may miss. Graph coverage is not a guarantee that all references were found.
+- Inspect the actual diff and use `detect_changes({scope: "all", repo})` to check affected flows; use the appropriate staged scope before committing. Run relevant validation and resolve failures caused by the change.
+- If tools or the index are unavailable, continue read-only planning and source inspection. For a stale index, run `node .gitnexus/run.cjs analyze` within existing authorization. Do not silently bypass mandatory project checks.
 
-```
-1. impact({target: "X", direction: "upstream"})  → Map all dependents
-2. query({search_query: "X"})                            → Find execution flows involving X
-3. context({name: "X"})                           → See all incoming/outgoing refs
-4. Plan update order: interfaces → implementations → callers → tests
-```
-
-> If "Index is stale" → run `node .gitnexus/run.cjs analyze` in terminal.
-
-## Checklists
-
-### Rename Symbol
-```
-- [ ] rename({symbol_name: "oldName", new_name: "newName", dry_run: true}) — preview all edits
-- [ ] Review graph edits (high confidence) and text_search edits (review carefully)
-- [ ] If satisfied: rename({..., dry_run: false}) — apply edits
-- [ ] detect_changes() — verify only expected files changed
-- [ ] Run tests for affected processes
-```
-
-### Extract Module
-```
-- [ ] context({name: target}) — see all incoming/outgoing refs
-- [ ] impact({target, direction: "upstream"}) — find all external callers
-- [ ] Define new module interface
-- [ ] Extract code, update imports
-- [ ] detect_changes() — verify affected scope
-- [ ] Run tests for affected processes
-```
-
-### Split Function/Service
-```
-- [ ] context({name: target}) — understand all callees
-- [ ] Group callees by responsibility
-- [ ] impact({target, direction: "upstream"}) — map callers to update
-- [ ] Create new functions/services
-- [ ] Update callers
-- [ ] detect_changes() — verify affected scope
-- [ ] Run tests for affected processes
-```
-
-## Tools
-
-**rename** — automated multi-file rename:
-```
-rename({symbol_name: "validateUser", new_name: "authenticateUser", dry_run: true})
-→ 12 edits across 8 files
-→ 10 graph edits (high confidence), 2 text_search edits (review)
-→ Changes: [{file_path, edits: [{line, old_text, new_text, confidence}]}]
-```
-
-**impact** — map all dependents first:
-```
-impact({target: "validateUser", direction: "upstream"})
-→ d=1: loginHandler, apiMiddleware, testUtils
-→ Affected Processes: LoginFlow, TokenRefresh
-```
-
-**detect_changes** — verify your changes after refactoring:
-```
-detect_changes({scope: "all"})
-→ Changed: 8 files, 12 symbols
-→ Affected processes: LoginFlow, TokenRefresh
-→ Risk: MEDIUM
-```
-
-**cypher** — custom reference queries:
-```cypher
-MATCH (caller)-[:CodeRelation {type: 'CALLS'}]->(f:Function {name: "validateUser"})
-RETURN caller.name, caller.filePath ORDER BY caller.filePath
-```
-
-## Risk Rules
-
-| Risk Factor | Mitigation |
-|-------------|------------|
-| Many callers (>5) | Use rename for automated updates |
-| Cross-area refs | Use detect_changes after to verify scope |
-| String/dynamic refs | query to find them |
-| External/public API | Version and deprecate properly |
-
-## Example: Rename `validateUser` to `authenticateUser`
-
-```
-1. rename({symbol_name: "validateUser", new_name: "authenticateUser", dry_run: true})
-   → 12 edits: 10 graph (safe), 2 text_search (review)
-   → Files: validator.ts, login.ts, middleware.ts, config.json...
-
-2. Review text_search edits (config.json: dynamic reference!)
-
-3. rename({symbol_name: "validateUser", new_name: "authenticateUser", dry_run: false})
-   → Applied 12 edits across 8 files
-
-4. detect_changes({scope: "all"})
-   → Affected: LoginFlow, TokenRefresh
-   → Risk: MEDIUM — run tests for these flows
-```
+Report the completed change and validation, or deliver a plan/preview when implementation was not requested.
