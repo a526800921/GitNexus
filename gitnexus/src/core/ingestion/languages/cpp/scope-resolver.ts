@@ -9,6 +9,7 @@ import {
   tagNamespacePrefixes,
 } from '../../scope-resolution/scope/walkers.js';
 import type { ScopeResolver } from '../../scope-resolution/contract/scope-resolver.js';
+import { extractElementTypeFromString } from '../../type-extractors/shared.js';
 import { cppProvider } from '../c-cpp.js';
 import { cppArityCompatibility } from './arity.js';
 import { CPP_CONVERSION_ONLY_ARG_TYPE_PREFIXES, cppConversionRank } from './conversion-rank.js';
@@ -46,6 +47,13 @@ import {
   clearCppMemberLookupState,
   resolveCppReceiverMember,
 } from './member-lookup.js';
+import { stripCppSpecifiers } from './interpret.js';
+import { perFileSet } from '../../import-resolvers/per-file-set.js';
+
+/** A pointee worth binding: a bare identifier, not `T**`, `T[]`, `A::B` or a
+ *  template spelling. Hoisted — a literal here would mint a fresh RegExp on
+ *  every subscript the resolver folds. */
+const CPP_SIMPLE_POINTEE_RE = /^[A-Za-z_]\w*$/;
 
 /**
  * Per-pass memo of the augmented `#include`-resolution file set
@@ -54,32 +62,25 @@ import {
  * a fresh ~F-entry `Set` on every call AND defeated the shared
  * `resolveCImportTarget` suffix-index memo (in `c/import-target.ts`) by handing
  * it a new set identity each time. Both inputs are stable per pass, so the
- * union is built once and reused. `WeakMap`-keyed → reclaimed with the pass.
- * (Twin of the C resolver's `augmentedFilePaths`.)
+ * union is built once and reused. Reclaimed with the pass.
+ *
+ * Two inputs, so two levels of `perFileSet` composed rather than a second
+ * primitive: the outer memo's value is the inner memo, and a function is an
+ * object, which is all `T extends object` asks for.
+ *
+ * (Twin of the C resolver's `augmentedFilePathsFor`.) The two memos stay
+ * SEPARATE deliberately. C++ delegates to `resolveCImportTarget`, whose
+ * `suffixIndex` memo is keyed on the augmented set, so a single memo shared
+ * with C would hand each language the other's index — same
+ * builder-shared/memo-separate rule as `import-resolvers/pass-cache.ts`.
  */
-const augmentedPathsByPass = new WeakMap<
-  ReadonlySet<string>,
-  WeakMap<ReadonlySet<string>, ReadonlySet<string>>
->();
-
-function augmentedFilePaths(
-  allFilePaths: ReadonlySet<string>,
-  headerPaths: ReadonlySet<string>,
-): ReadonlySet<string> {
-  let byHeaders = augmentedPathsByPass.get(allFilePaths);
-  if (byHeaders === undefined) {
-    byHeaders = new WeakMap();
-    augmentedPathsByPass.set(allFilePaths, byHeaders);
-  }
-  let augmented = byHeaders.get(headerPaths);
-  if (augmented === undefined) {
+const augmentedFilePathsFor = perFileSet((allFilePaths: ReadonlySet<string>) =>
+  perFileSet((headerPaths: ReadonlySet<string>): ReadonlySet<string> => {
     const set = new Set(allFilePaths);
     for (const h of headerPaths) set.add(h);
-    augmented = set;
-    byHeaders.set(headerPaths, augmented);
-  }
-  return augmented;
-}
+    return set;
+  }),
+);
 
 /**
  * C++ `ScopeResolver` registered in `SCOPE_RESOLVERS` and consumed by
@@ -121,7 +122,7 @@ export const cppScopeResolver: ScopeResolver = {
       return resolveCppImportTarget(
         targetRaw,
         fromFile,
-        augmentedFilePaths(allFilePaths, headerPaths),
+        augmentedFilePathsFor(allFilePaths)(headerPaths),
       );
     }
     return resolveCppImportTarget(targetRaw, fromFile, allFilePaths);
@@ -247,6 +248,29 @@ export const cppScopeResolver: ScopeResolver = {
     return mro.includes(lhsDef.nodeId);
   },
 
+  // Subscript route only — C++ collection views are method calls.
+  //
+  // Two container spellings reach a subscript. A POINTER is one of them: `p[i]`
+  // on a `User*` is pointer arithmetic yielding a `User`, so the trailing `*` is
+  // peeled here rather than by `stripTypePreservingDecoration` (C++ declares
+  // none) — and peeling it at a bare class lookup instead would be wrong, since
+  // that is the route by which `p->m()` must keep seeing `User`'s own members.
+  // The other is a template container (`std::vector<User>`), left to the shared
+  // extractor.
+  //
+  // Fed the annotation AS WRITTEN, since `normalizeCppTypeName` strips both the
+  // star and the array brackets at capture. `undefined` = "not a container", so
+  // an `operator[]`-bearing class does not fold `grid[0]` onto `Grid`.
+  elementTypeOf: (containerType, via) => {
+    if (via.kind !== 'index') return undefined;
+    const t = stripCppSpecifiers(containerType);
+    if (t.endsWith('*')) {
+      const pointee = t.slice(0, -1).trim();
+      return CPP_SIMPLE_POINTEE_RE.test(pointee) ? pointee : undefined;
+    }
+    return extractElementTypeFromString(t);
+  },
+
   // C++ is statically typed — disable field fallback heuristic
   fieldFallbackOnMethodLookup: false,
   // C++ needs return type propagation across #include boundaries
@@ -286,6 +310,20 @@ export const cppScopeResolver: ScopeResolver = {
     // walked at `populateOwners` time into a per-file nodeId set.
     if (!isCppDefGloballyVisible(def.filePath, def.nodeId)) return true;
     return false;
+  },
+
+  // Keep declaration/definition identity narrower than the global free-call
+  // visibility gate above: namespace and class ownership do not imply
+  // internal linkage, while a namespace-scope `static` function does.
+  hasFileLocalCallableLinkage: (def: SymbolDefinition) => {
+    // Class members have EXTERNAL linkage even when declared `static` —
+    // inside a class, `static` means "no instance", not internal linkage.
+    // The name-keyed set below is populated from every `static` declaration,
+    // so without this gate a header-declared static member refused its
+    // cross-file definition join (#2522 review, M2).
+    if (def.type === 'Method' || def.type === 'Constructor') return false;
+    const simple = def.qualifiedName?.split('.').pop() ?? def.qualifiedName ?? '';
+    return isFileLocal(def.filePath, simple);
   },
 
   // C++ two-phase template lookup: inside a class template body,

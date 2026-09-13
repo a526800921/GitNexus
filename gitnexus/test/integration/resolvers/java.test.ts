@@ -1,8 +1,11 @@
 /**
  * Java: class extends + implements multiple interfaces + ambiguous package disambiguation
  */
-import { describe, it, expect, beforeAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import path from 'path';
+import fs from 'node:fs';
+import os from 'node:os';
+import { _captureLogger, type PinoLogRecord } from '../../../src/core/logger.js';
 import {
   FIXTURES,
   CROSS_FILE_FIXTURES,
@@ -10,7 +13,9 @@ import {
   getNodesByLabel,
   getNodesByLabelFull,
   edgeSet,
+  getResolutionOutcomes,
   runPipelineFromRepo,
+  writeFixtureRepo,
   type PipelineResult,
 } from './helpers.js';
 
@@ -549,6 +554,49 @@ describe('Java named import disambiguation', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Declared-package resolution (#2910): external imports cannot suffix-match
+// local lookalikes, while file layout does not override package declarations.
+// ---------------------------------------------------------------------------
+
+describe('Java declared-package import resolution (#2910)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'java-import-package-evidence'),
+      () => {},
+    );
+  }, 60000);
+
+  it('does not emit an IMPORTS edge from java.util.List to local util/List.java', () => {
+    const imports = getRelationships(result, 'IMPORTS');
+    expect(
+      imports.some(
+        (edge) =>
+          edge.sourceFilePath === 'app/Main.java' && edge.targetFilePath === 'util/List.java',
+      ),
+    ).toBe(false);
+  });
+
+  it('resolves a declared package even when the file path is flattened', () => {
+    const imports = getRelationships(result, 'IMPORTS');
+    expect(
+      imports.some(
+        (edge) => edge.sourceFilePath === 'app/Main.java' && edge.targetFilePath === 'User.java',
+      ),
+    ).toBe(true);
+
+    const calls = getRelationships(result, 'CALLS');
+    expect(
+      calls.some(
+        (edge) =>
+          edge.source === 'run' && edge.target === 'save' && edge.targetFilePath === 'User.java',
+      ),
+    ).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Variadic resolution: String... doesn't get filtered by arity
 // ---------------------------------------------------------------------------
 
@@ -621,7 +669,7 @@ describe('Java variadic call resolution', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Wildcard import: `import com.example.models.*` resolves to a package file
+// Wildcard import: `import com.example.models.*` resolves every package file
 // ---------------------------------------------------------------------------
 
 describe('Java wildcard import resolution', () => {
@@ -631,15 +679,14 @@ describe('Java wildcard import resolution', () => {
     result = await runPipelineFromRepo(path.join(FIXTURES, 'java-wildcard-import'), () => {});
   }, 60000);
 
-  it('parses wildcard import without errors and creates graph nodes', () => {
-    // The wildcard import (`import com.example.models.*`) exercises the
-    // directoryChild branch in resolveJavaImportTarget.  Even if no IMPORTS
-    // edge is created (nondeterministic file selection — documented flip
-    // blocker), the graph must contain valid nodes for all classes.
-    const classes = getNodesByLabel(result, 'Class');
-    expect(classes).toContain('Main');
-    expect(classes).toContain('User');
-    expect(classes).toContain('Order');
+  it('emits IMPORTS edges to every file declaring the wildcard package', () => {
+    const imports = getRelationships(result, 'IMPORTS').filter(
+      (edge) => edge.sourceFilePath === 'com/example/app/Main.java',
+    );
+    expect(imports.map((edge) => edge.targetFilePath).sort()).toEqual([
+      'com/example/models/Order.java',
+      'com/example/models/User.java',
+    ]);
   });
 
   it('resolves user.save() call via wildcard-imported User', () => {
@@ -1172,6 +1219,380 @@ describe('Java chained method call resolution', () => {
     expect(userSave).toBeDefined();
     expect(repoSave).toBeUndefined();
   });
+});
+
+// ---------------------------------------------------------------------------
+// Chained call on a new-expression receiver: new Local().inner()
+// The receiver of inner() is an object_creation_expression, not a variable.
+// Regression test for #2564: without treating `new Local()` as a typed
+// receiver, the call falls back to name-only resolution and can pick an
+// unrelated same-named method (Other.inner) instead of Local.inner.
+// ---------------------------------------------------------------------------
+
+describe('Java chained call on a new-expression receiver (#2564)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'java-new-expr-chain-call'), () => {});
+  }, 60000);
+
+  it('detects LocalChain and Other classes', () => {
+    const classes = getNodesByLabel(result, 'Class');
+    expect(classes).toContain('LocalChain');
+    expect(classes).toContain('Other');
+  });
+
+  it('resolves new Local().inner() to the local Local#inner, NOT Other#inner', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const localInner = calls.find(
+      (c) =>
+        c.target === 'inner' && c.source === 'm' && c.targetFilePath.includes('LocalChain.java'),
+    );
+    const otherInner = calls.find(
+      (c) => c.target === 'inner' && c.source === 'm' && c.targetFilePath.includes('Other.java'),
+    );
+    expect(localInner).toBeDefined();
+    expect(otherInner).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Java record: container node + HAS_METHOD edges
+// Regression test for #2564: JAVA_QUERIES previously had no @definition.record
+// capture, so a record never got a Class/Record graph node — its methods
+// existed as ownerless orphans with no HAS_METHOD edge.
+// ---------------------------------------------------------------------------
+
+describe('Java record method resolution (#2564)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'java-record-methods'), () => {});
+  }, 60000);
+
+  it('detects a Record node for Point', () => {
+    const records = getNodesByLabel(result, 'Record');
+    expect(records).toContain('Point');
+  });
+
+  it('emits HAS_METHOD edges linking sum and scaled to Point', () => {
+    const hasMethod = getRelationships(result, 'HAS_METHOD');
+    const sumEdge = hasMethod.find((e) => e.source === 'Point' && e.target === 'sum');
+    const scaledEdge = hasMethod.find((e) => e.source === 'Point' && e.target === 'scaled');
+    expect(sumEdge).toBeDefined();
+    expect(scaledEdge).toBeDefined();
+  });
+
+  it('resolves scaled() calling sum() via a CALLS edge', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const sumCall = calls.find((c) => c.target === 'sum' && c.source === 'scaled');
+    expect(sumCall).toBeDefined();
+  });
+
+  // #2936: the implicit accessor is minted at the COMPONENT's position, so on a
+  // single line it shares (name, line) with an explicit overload. The worker's
+  // per-class method map keyed on that pair, so the appended implicit entry
+  // evicted the source-written method and both definitions collapsed onto
+  // `Scaled.x#0` — the arity-1 call then bound to a zero-argument target.
+  it('keeps a same-line explicit overload distinct from the implicit accessor (#2936)', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gitnexus-java-record-sameline-'));
+    try {
+      writeFixtureRepo(root, {
+        'Scaled.java':
+          'package probe;\npublic record Scaled(int x, int y) { int x(int factor) { return x * factor; } }\n',
+      });
+
+      const linked = await runPipelineFromRepo(root, () => {});
+      const arities = getNodesByLabelFull(linked, 'Method')
+        .filter((node) => node.name === 'x')
+        .map((node) => Number(node.properties.parameterCount))
+        .sort((left, right) => left - right);
+
+      expect(arities).toEqual([0, 1]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }, 60000);
+
+  it('uses the Record node as a caller source and constructor-call target (#2801)', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gitnexus-java-record-link-'));
+    try {
+      writeFixtureRepo(root, {
+        'Point.java': `package probe;
+          public record Point(int x) {
+            private static final int SEED = initialize();
+            private static int initialize() { return 1; }
+          }`,
+        'Use.java':
+          'package probe; public class Use { public Point make() { return new Point(1); } }',
+      });
+
+      const linked = await runPipelineFromRepo(root, () => {});
+      const initializerCall = getRelationships(linked, 'CALLS').find(
+        (edge) => edge.source === 'Point' && edge.target === 'initialize',
+      );
+      expect(initializerCall?.sourceLabel).toBe('Record');
+
+      const constructorCall = getRelationships(linked, 'CALLS').find(
+        (edge) => edge.source === 'make' && edge.target === 'Point',
+      );
+      expect(constructorCall?.targetLabel).toBe('Record');
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }, 60000);
+
+  it('links and dispatches an explicit Record interface method (#2900)', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gitnexus-java-record-heritage-'));
+    try {
+      writeFixtureRepo(root, {
+        'RecordHeritage.java': `interface Named { String name(); }
+          record User(String value) implements Named {
+            public String name() { return value; }
+          }
+          class Reader {
+            String read(Named value) { return value.name(); }
+          }`,
+      });
+
+      const linked = await runPipelineFromRepo(root, () => {});
+      const implementsEdge = getRelationships(linked, 'IMPLEMENTS').find(
+        (edge) => edge.source === 'User' && edge.target === 'Named',
+      );
+      const fanout = getRelationships(linked, 'CALLS').filter(
+        (edge) =>
+          edge.source === 'read' &&
+          edge.target === 'name' &&
+          edge.rel.reason === 'interface-dispatch',
+      );
+
+      expect(implementsEdge?.sourceLabel).toBe('Record');
+      expect(implementsEdge?.targetLabel).toBe('Interface');
+      expect(fanout.map((edge) => `${edge.targetLabel}:${edge.targetFilePath}`).sort()).toEqual([
+        'Method:RecordHeritage.java',
+      ]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }, 60000);
+
+  it('materializes implicit accessors and dispatches them through a Record interface (#2917)', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gitnexus-java-record-accessor-'));
+    try {
+      writeFixtureRepo(root, {
+        'Named.java': 'interface Named { String name(); }',
+        'User.java': 'record User(String name, java.util.List<String> tags) implements Named {}',
+        'Explicit.java': `record Explicit(String name) implements Named {
+          public String name() { return name.toUpperCase(); }
+        }`,
+        'Reader.java': `class Reader {
+          String read(Named value) { return value.name(); }
+          java.util.List<String> directTags(User value) { return value.tags(); }
+        }`,
+      });
+
+      const linked = await runPipelineFromRepo(root, () => {});
+      const implementsEdge = getRelationships(linked, 'IMPLEMENTS').find(
+        (edge) => edge.source === 'User' && edge.target === 'Named',
+      );
+      const fanout = getRelationships(linked, 'CALLS').filter(
+        (edge) =>
+          edge.source === 'read' &&
+          edge.target === 'name' &&
+          edge.rel.reason === 'interface-dispatch',
+      );
+
+      const methods = getNodesByLabelFull(linked, 'Method');
+      const userName = methods.find(
+        (method) => method.name === 'name' && method.properties.filePath.endsWith('User.java'),
+      );
+      const userTags = methods.find(
+        (method) => method.name === 'tags' && method.properties.filePath.endsWith('User.java'),
+      );
+      const explicitNames = methods.filter(
+        (method) => method.name === 'name' && method.properties.filePath.endsWith('Explicit.java'),
+      );
+      const userHasMethod = getRelationships(linked, 'HAS_METHOD').filter(
+        (edge) => edge.source === 'User' && (edge.target === 'name' || edge.target === 'tags'),
+      );
+      const methodImplements = getRelationships(linked, 'METHOD_IMPLEMENTS').filter(
+        (edge) => edge.source === 'name' && edge.target === 'name',
+      );
+      const directTags = getRelationships(linked, 'CALLS').find(
+        (edge) => edge.source === 'directTags' && edge.target === 'tags',
+      );
+
+      expect(implementsEdge?.sourceLabel).toBe('Record');
+      expect(implementsEdge?.targetLabel).toBe('Interface');
+      expect(userName?.properties).toMatchObject({
+        parameterCount: 0,
+        returnType: 'String',
+        visibility: 'public',
+      });
+      expect(userTags?.properties).toMatchObject({
+        parameterCount: 0,
+        returnType: 'java.util.List<String>',
+        visibility: 'public',
+      });
+      expect(explicitNames).toHaveLength(1);
+      expect(userHasMethod.map((edge) => edge.target).sort()).toEqual(['name', 'tags']);
+      expect(methodImplements.map((edge) => edge.sourceFilePath).sort()).toEqual([
+        expect.stringContaining('Explicit.java'),
+        expect.stringContaining('User.java'),
+      ]);
+      expect(fanout.map((edge) => edge.targetFilePath).sort()).toEqual([
+        expect.stringContaining('Explicit.java'),
+        expect.stringContaining('User.java'),
+      ]);
+      expect(directTags?.targetFilePath).toContain('User.java');
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }, 60000);
+});
+
+describe('Java enum interface heritage (#2918)', () => {
+  it('links and dispatches an Enum interface method (#2918)', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gitnexus-java-enum-heritage-'));
+    try {
+      writeFixtureRepo(root, {
+        'EnumHeritage.java': `import java.lang.annotation.ElementType;
+          import java.lang.annotation.Target;
+          @Target(ElementType.TYPE_USE) @interface Marker {}
+          interface Named { String label(); }
+          enum Status implements @Marker Named {
+            ACTIVE;
+            public String label() { return "active"; }
+          }
+          class Reader {
+            String read(Named value) { return value.label(); }
+          }`,
+      });
+
+      const linked = await runPipelineFromRepo(root, () => {});
+      const implementsEdges = getRelationships(linked, 'IMPLEMENTS').filter(
+        (edge) => edge.source === 'Status' && edge.target === 'Named',
+      );
+      const fanout = getRelationships(linked, 'CALLS').filter(
+        (edge) =>
+          edge.source === 'read' &&
+          edge.target === 'label' &&
+          edge.rel.reason === 'interface-dispatch',
+      );
+
+      expect(implementsEdges).toHaveLength(1);
+      expect(implementsEdges[0]?.sourceLabel).toBe('Enum');
+      expect(implementsEdges[0]?.targetLabel).toBe('Interface');
+      expect(fanout.map((edge) => edge.rel.targetId).sort()).toEqual([
+        'Method:EnumHeritage.java:Status.label#0',
+      ]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }, 60000);
+
+  it('keeps enum constant-body methods distinct while preserving enum heritage (#2918)', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gitnexus-java-enum-constant-body-'));
+    try {
+      writeFixtureRepo(root, {
+        'EnumConstantBody.java': `interface Named { String label(); }
+          enum Status implements Named {
+            ACTIVE { public String label() { return "active"; } },
+            INACTIVE;
+            public String label() { return "inactive"; }
+          }
+          class Reader {
+            String read(Named value) { return value.label(); }
+          }`,
+      });
+
+      const linked = await runPipelineFromRepo(root, () => {});
+      const implementsEdges = getRelationships(linked, 'IMPLEMENTS').filter(
+        (edge) => edge.source === 'Status' && edge.target === 'Named',
+      );
+
+      expect(implementsEdges).toHaveLength(1);
+      expect(implementsEdges[0]?.sourceLabel).toBe('Enum');
+      expect(getNodesByLabel(linked, 'Method').filter((name) => name === 'label')).toHaveLength(3);
+      const fanout = getRelationships(linked, 'CALLS').filter(
+        (edge) =>
+          edge.source === 'read' &&
+          edge.target === 'label' &&
+          edge.rel.reason === 'interface-dispatch',
+      );
+      expect(fanout.map((edge) => edge.rel.targetId).sort()).toEqual([
+        'Method:EnumConstantBody.java:Status$1.label#0',
+        'Method:EnumConstantBody.java:Status.label#0',
+      ]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }, 60000);
+
+  it('keeps non-synthetic implementations ahead of abstract enum constant bodies at the cap', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gitnexus-java-enum-fanout-cap-'));
+    try {
+      const constants = Array.from(
+        { length: 40 },
+        (_, index) => `A${index} { public String label() { return "enum-${index}"; } }`,
+      ).join(',\n');
+      const classes = Array.from(
+        { length: 30 },
+        (_, index) =>
+          `class ZImpl${index} extends ZBase { public String label() { return "class-${index}"; } }`,
+      ).join('\n');
+      writeFixtureRepo(root, {
+        'Fanout.java': `interface Named { String label(); }
+          enum AaaBig implements Named {
+            ${constants};
+            public abstract String label();
+          }
+          abstract class ZBase implements Named { public abstract String label(); }
+          ${classes}
+          class Reader { String read(Named value) { return value.label(); } }`,
+      });
+
+      const loggerCapture = _captureLogger();
+      let linked: PipelineResult;
+      let logRecords: PinoLogRecord[];
+      try {
+        linked = await runPipelineFromRepo(root, () => {});
+        logRecords = loggerCapture.records();
+      } finally {
+        loggerCapture.restore();
+      }
+      const fanoutIds = getRelationships(linked, 'CALLS')
+        .filter(
+          (edge) =>
+            edge.source === 'read' &&
+            edge.target === 'label' &&
+            edge.rel.reason === 'interface-dispatch',
+        )
+        .map((edge) => edge.rel.targetId);
+
+      expect(fanoutIds).toHaveLength(32);
+      for (let index = 0; index < 30; index++) {
+        expect(fanoutIds).toContain(`Method:Fanout.java:ZImpl${index}.label#0`);
+      }
+      expect(fanoutIds).toContain('Method:Fanout.java:AaaBig$1.label#0');
+      expect(fanoutIds).toContain('Method:Fanout.java:AaaBig$2.label#0');
+
+      const warning = logRecords.find(
+        (record) =>
+          record.msg ===
+          'interface-dispatch: members over the fan-out cap dropped implementors (their CALLS edges were not emitted)',
+      );
+      expect(warning).toMatchObject({
+        dispatchFanoutSkipped: 38,
+        fanoutCap: 32,
+        dispatchFanoutSkippedNames: [
+          'Named.label (70 targets; dropped: AaaBig$3.label, AaaBig$4.label, AaaBig$5.label, AaaBig$6.label, AaaBig$7.label, +33 more)',
+        ],
+      });
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }, 60000);
 });
 
 // ---------------------------------------------------------------------------
@@ -2723,5 +3144,485 @@ describe('Java bare-this dispatch (Case 4 pinning)', () => {
       expect(edge.targetFilePath).not.toBe('models/Task.java');
       expect(edge.targetFilePath).not.toBe('models/Runner.java');
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issues #2545/#2550: an anonymous class body (`new Runnable() { public
+// void run() {} }`) is a first-class instance. It gets a synthesized
+// javac-style Class node (`Worker$1`), owns its methods (re-keyed
+// `Worker$1.run`), and the enclosing-owner walk attributes to it instead
+// of the lexically enclosing named class. `(object_creation_expression
+// (class_body) @scope.class)` (from #2545) provides the scope boundary;
+// the #2550 instance model provides identity + ownership.
+// ---------------------------------------------------------------------------
+
+describe('Java anonymous-class instance identity (#2550)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'java-anonymous-class-scope'), () => {});
+  }, 60000);
+
+  it('emits a Class node Worker$1 for the anonymous Runnable body', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('Worker$1');
+  });
+
+  it('re-keys the anonymous run method to Worker$1.run and owns it via HAS_METHOD', () => {
+    const hasMethod = getRelationships(result, 'HAS_METHOD');
+    const owned = hasMethod.find(
+      (e) =>
+        e.rel.sourceId === 'Class:src/Worker.java:Worker$1' &&
+        e.rel.targetId === 'Method:src/Worker.java:Worker$1.run#0',
+    );
+    expect(owned).toBeDefined();
+  });
+
+  it('still extracts the anonymous Runnable method as a Method', () => {
+    expect(getNodesByLabel(result, 'Method')).toContain('run');
+  });
+
+  it('resolves handler.run() to Worker$1.run via the receiver path, not the free-call leak', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const explicit = calls.find((c) => c.source === 'makeHandler' && c.target === 'run');
+    expect(explicit).toBeDefined();
+    expect(explicit!.rel.targetId).toBe('Method:src/Worker.java:Worker$1.run#0');
+    expect(explicit!.rel.reason).not.toBe('local-call');
+  });
+
+  it("does not resolve process()'s bare run() to the anonymous class's method (any reason)", () => {
+    const calls = getRelationships(result, 'CALLS');
+    const leaked = calls.find((c) => c.source === 'process' && c.target === 'run');
+    expect(leaked).toBeUndefined();
+  });
+});
+
+describe('Java instance-ownership free-call gate (#2550)', () => {
+  it("does not resolve a bare call to an unrelated same-file class's method", async () => {
+    const result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'java-unrelated-method-collision'),
+      () => {},
+    );
+    const calls = getRelationships(result, 'CALLS');
+    const leaked = calls.find((c) => c.source === 'work' && c.target === 'helper');
+    expect(leaked).toBeUndefined();
+  }, 60000);
+
+  it("still resolves a class's own bare call to its own method (implicit this)", async () => {
+    const result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'java-builtin-name-legit-dispatch'),
+      () => {},
+    );
+    const calls = getRelationships(result, 'CALLS');
+    const legitimate = calls.find((c) => c.source === 'trigger' && c.target === 'run');
+    expect(legitimate).toBeDefined();
+    expect(legitimate!.targetFilePath).toBe('src/RealTask.java');
+  }, 60000);
+
+  it('still resolves a bare inherited call through the MRO arm', async () => {
+    const result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'java-inherited-bare-call'),
+      () => {},
+    );
+    const calls = getRelationships(result, 'CALLS');
+    const inherited = calls.find((c) => c.source === 'go' && c.target === 'log');
+    expect(inherited).toBeDefined();
+  }, 60000);
+
+  it('numbers multiple anonymous bodies in source order (Multi$1, Multi$2)', async () => {
+    const result = await runPipelineFromRepo(path.join(FIXTURES, 'java-anon-numbering'), () => {});
+    const classes = getNodesByLabel(result, 'Class');
+    expect(classes).toContain('Multi$1');
+    expect(classes).toContain('Multi$2');
+  }, 60000);
+});
+
+describe('Java local-type identity and lexical scope (#2562)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'java-local-class-naming'), () => {});
+  }, 60000);
+
+  it('matches javac local-name and anonymous-name sequences per immediate host', () => {
+    const classes = getNodesByLabel(result, 'Class');
+    expect(classes).toContain('Outer$1Local');
+    expect(classes).toContain('Outer$1CtorHost');
+    expect(classes).toContain('Outer$1NestedHost');
+    expect(classes).toContain('Outer$1');
+    expect(classes).toContain('Outer$2');
+    expect(classes).toContain('Outer$2Local');
+    expect(classes).toContain('Outer$1Local$1');
+    expect(classes).toContain('Outer$1CtorHost$1Local');
+    expect(classes).toContain('Outer$1NestedHost$Member$1Local');
+    expect(classes).toContain('Outer$MemberHost$1Local');
+    expect(classes).toContain('Outer$1StaticLocal');
+    expect(classes).toContain('Outer$1InstanceLocal');
+    expect(classes).toContain('Outer$1LambdaLocal');
+    expect(classes).toContain('Outer$3$1Local');
+    expect(classes).toContain('Compact$1Local');
+    expect(classes).toContain('Compact$1');
+    expect(classes).not.toContain('Local');
+  });
+
+  it('emits the correct graph label and owner for every local type kind', () => {
+    expect(getNodesByLabel(result, 'Enum')).toContain('Types$1E');
+    expect(getNodesByLabel(result, 'Record')).toContain('Types$1R');
+    expect(getNodesByLabel(result, 'Interface')).toContain('Types$1I');
+    expect(getNodesByLabel(result, 'Class')).not.toContain('Types$1E');
+    expect(getNodesByLabel(result, 'Class')).not.toContain('Types$1R');
+    expect(getNodesByLabel(result, 'Class')).not.toContain('Types$1I');
+
+    const hasMethod = getRelationships(result, 'HAS_METHOD');
+    for (const [label, owner, method] of [
+      ['Class', 'Outer$1Local', 'inner'],
+      ['Class', 'Outer$2Local', 'inner'],
+      ['Class', 'Outer$1CtorHost$1Local', 'inner'],
+      ['Class', 'Outer$1NestedHost$Member', 'make'],
+      ['Enum', 'Types$1E', 'enumHit'],
+      ['Record', 'Types$1R', 'recordHit'],
+      ['Interface', 'Types$1I', 'run'],
+    ]) {
+      expect(
+        hasMethod.some(
+          (edge) =>
+            edge.rel.sourceId ===
+              `${label}:src/${owner.startsWith('Types') ? 'Types' : 'Outer'}.java:${owner}` &&
+            edge.rel.targetId ===
+              `Method:src/${owner.startsWith('Types') ? 'Types' : 'Outer'}.java:${owner}.${method}#0`,
+        ),
+      ).toBe(true);
+    }
+  });
+
+  it('keeps source-level construction dispatch bound to each local identity', () => {
+    const calls = getRelationships(result, 'CALLS');
+    expect(calls.find((c) => c.source === 'first' && c.target === 'inner')?.rel.targetId).toBe(
+      'Method:src/Outer.java:Outer$1Local.inner#0',
+    );
+    expect(calls.find((c) => c.source === 'second' && c.target === 'inner')?.rel.targetId).toBe(
+      'Method:src/Outer.java:Outer$2Local.inner#0',
+    );
+    expect(calls.find((c) => c.source === 'CtorHost' && c.target === 'inner')?.rel.targetId).toBe(
+      'Method:src/Outer.java:Outer$1CtorHost$1Local.inner#0',
+    );
+    for (const targetId of [
+      'Method:src/Outer.java:Outer$1StaticLocal.staticHit#0',
+      'Method:src/Outer.java:Outer$1InstanceLocal.instanceHit#0',
+      'Method:src/Outer.java:Outer$1LambdaLocal.lambdaHit#0',
+      'Method:src/Outer.java:Outer$3$1Local.anonymousHit#0',
+      'Method:src/Outer.java:Outer$MemberHost$1Local.ordinaryMemberHit#0',
+      'Method:src/Compact.java:Compact$1Local.inner#0',
+      'Method:src/Types.java:Types$1E.enumHit#0',
+      'Method:src/Types.java:Types$1R.recordHit#0',
+      'Method:src/Types.java:Types$1.run#0',
+    ]) {
+      expect(
+        calls.some((call) => call.rel.targetId === targetId),
+        targetId,
+      ).toBe(true);
+    }
+  });
+
+  it('respects declaration-order visibility against a same-named member type', () => {
+    const calls = getRelationships(result, 'CALLS').filter(
+      (call) => call.source === 'declarationOrder',
+    );
+
+    expect(calls.find((call) => call.target === 'member')?.rel.targetId).toBe(
+      'Method:src/Outer.java:Cyclic.member#0',
+    );
+    expect(calls.find((call) => call.target === 'local')?.rel.targetId).toBe(
+      'Method:src/Outer.java:Outer$1Cyclic.local#0',
+    );
+  });
+
+  it('keeps same-named local types isolated to their disjoint blocks', () => {
+    const calls = getRelationships(result, 'CALLS').filter((call) => call.source === 'blocks');
+
+    expect(calls.find((call) => call.target === 'firstBlock')?.rel.targetId).toBe(
+      'Method:src/Outer.java:Outer$3Local.firstBlock#0',
+    );
+    expect(calls.find((call) => call.target === 'secondBlock')?.rel.targetId).toBe(
+      'Method:src/Outer.java:Outer$4Local.secondBlock#0',
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #2550 review hardening: (a) an anonymous class inherits from its
+// constructed type, so bare calls to inherited methods INSIDE the
+// anonymous body pass the ownership gate's MRO arm (review caught the
+// gate suppressing that true edge — the anon had no EXTENDS edge and an
+// empty MRO); (b) enum/interface/record hosts synthesize names too, and
+// a hostless anonymous body must NOT materialize a phantom Class node
+// named after the constructed type.
+// ---------------------------------------------------------------------------
+
+describe('Java anonymous-class inheritance and host coverage (#2550 review)', () => {
+  it('anon extending a same-file class keeps bare inherited calls and gains an EXTENDS edge', async () => {
+    const result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'java-anon-extends-base'),
+      () => {},
+    );
+    const extends_ = getRelationships(result, 'EXTENDS');
+    const anonExtends = extends_.find(
+      (e) => e.rel.sourceId === 'Class:src/App.java:AnonExtHost$1' && e.target === 'Base',
+    );
+    expect(anonExtends).toBeDefined();
+
+    const calls = getRelationships(result, 'CALLS');
+    const inherited = calls.find((c) => c.source === 'extra' && c.target === 'work');
+    expect(inherited).toBeDefined();
+    expect(inherited!.rel.targetId).toBe('Method:src/App.java:Base.work#0');
+  }, 60000);
+
+  it('enum-hosted anonymous body is modeled (EnumHost$1) with no phantom constructed-type Class', async () => {
+    const result = await runPipelineFromRepo(path.join(FIXTURES, 'java-anon-enum-host'), () => {});
+    const classes = getNodesByLabel(result, 'Class');
+    expect(classes).toContain('EnumHost$1');
+    expect(classes).not.toContain('Runnable');
+
+    const calls = getRelationships(result, 'CALLS');
+    const own = calls.find((c) => c.source === 'caller' && c.target === 'run');
+    expect(own).toBeDefined();
+    expect(own!.rel.targetId).toBe('Method:src/EnumHost.java:EnumHost.run#0');
+  }, 60000);
+});
+
+// ---------------------------------------------------------------------------
+// #2555: enum constant bodies (`enum E { A { ... } }`) are javac's other
+// anonymous-class shape (`E$N`). They join the instance model: synthesized
+// Class node, re-keyed owned methods, EXTENDS to the host enum (so bare
+// calls from the body to enum helpers pass the ownership gate's MRO arm),
+// and the same-file bare-call leak closed. Naming follows JLS 13.1
+// immediate-host binary names (`EnumWrap$Mode$1` for nested hosts).
+// ---------------------------------------------------------------------------
+
+describe('Java enum constant bodies (#2555)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'java-enum-constant-body'), () => {});
+  }, 60000);
+
+  it('models constant bodies as EnumConst$1 / EnumConst$2 with owned re-keyed methods', () => {
+    const classes = getNodesByLabel(result, 'Class');
+    expect(classes).toContain('EnumConst$1');
+    expect(classes).toContain('EnumConst$2');
+    expect(classes).not.toContain('A');
+
+    const hasMethod = getRelationships(result, 'HAS_METHOD');
+    const owned = hasMethod.find(
+      (e) =>
+        e.rel.sourceId === 'Class:src/EnumConst.java:EnumConst$1' &&
+        e.rel.targetId === 'Method:src/EnumConst.java:EnumConst$1.hook#0',
+    );
+    expect(owned).toBeDefined();
+  });
+
+  it('emits EXTENDS from each constant body to the host enum', () => {
+    const extends_ = getRelationships(result, 'EXTENDS');
+    const first = extends_.find(
+      (e) => e.rel.sourceId === 'Class:src/EnumConst.java:EnumConst$1' && e.target === 'EnumConst',
+    );
+    expect(first).toBeDefined();
+  });
+
+  it("resolves a constant body's bare call to an enum helper via the MRO arm", () => {
+    const calls = getRelationships(result, 'CALLS');
+    const inherited = calls.find((c) => c.source === 'hook' && c.target === 'log');
+    expect(inherited).toBeDefined();
+    expect(inherited!.rel.targetId).toBe('Method:src/EnumConst.java:EnumConst.log#0');
+  });
+
+  it("does not resolve an unrelated same-file class's bare hook() to any constant body", () => {
+    const calls = getRelationships(result, 'CALLS');
+    const leaked = calls.find((c) => c.source === 'caller' && c.target === 'hook');
+    expect(leaked).toBeUndefined();
+  });
+
+  it('names a nested-host anonymous body with the JLS 13.1 immediate-host chain', async () => {
+    const nested = await runPipelineFromRepo(
+      path.join(FIXTURES, 'java-nested-host-naming'),
+      () => {},
+    );
+    const classes = getNodesByLabel(nested, 'Class');
+    expect(classes).toContain('EnumWrap$Mode$1');
+    expect(classes).not.toContain('EnumWrap$1');
+  }, 60000);
+
+  it('chains anonymous enclosing types per JLS 13.1: anon inside anon is NestHost$1$1', async () => {
+    const result = await runPipelineFromRepo(path.join(FIXTURES, 'java-anon-in-anon'), () => {});
+    const classes = getNodesByLabel(result, 'Class');
+    expect(classes).toContain('NestHost$1');
+    expect(classes).toContain('NestHost$1$1');
+    expect(classes).not.toContain('NestHost$2');
+  }, 60000);
+
+  it('chains through enum constant bodies: anon inside a constant body is N$1$1', async () => {
+    const result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'java-anon-in-constant-body'),
+      () => {},
+    );
+    const classes = getNodesByLabel(result, 'Class');
+    expect(classes).toContain('N$1');
+    expect(classes).toContain('N$1$1');
+    expect(classes).not.toContain('N$2');
+
+    const hasMethod = getRelationships(result, 'HAS_METHOD');
+    const owned = hasMethod.find(
+      (e) =>
+        e.rel.sourceId === 'Class:src/N.java:N$1$1' &&
+        e.rel.targetId === 'Method:src/N.java:N$1$1.run#0',
+    );
+    expect(owned).toBeDefined();
+  }, 60000);
+
+  it('names a bodied constant in a NESTED enum with the full host chain (EnumWrap2$Mode$1)', async () => {
+    const result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'java-nested-enum-constant'),
+      () => {},
+    );
+    const classes = getNodesByLabel(result, 'Class');
+    expect(classes).toContain('EnumWrap2$Mode$1');
+    expect(classes).not.toContain('EnumWrap2$1');
+  }, 60000);
+
+  it('attributes same-named methods across sibling constant bodies to their own classes', async () => {
+    // Review-caught collapse: the scope-side qualifier chained the
+    // synthesized class def to `M3.M3$2`, desyncing from the structure
+    // node id, so both bodies' `hook` calls attributed to M3$1's node
+    // via the simple-name fallback. Each body's caller must be its own.
+    const result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'java-enum-constant-same-name'),
+      () => {},
+    );
+    const calls = getRelationships(result, 'CALLS');
+    const fromA = calls.find(
+      (c) =>
+        c.rel.sourceId === 'Method:src/M3.java:M3$1.hook#0' &&
+        c.rel.targetId === 'Method:src/M3.java:M3.base#0',
+    );
+    const fromC = calls.find(
+      (c) =>
+        c.rel.sourceId === 'Method:src/M3.java:M3$2.hook#0' &&
+        c.rel.targetId === 'Method:src/M3.java:M3.log#0',
+    );
+    expect(fromA).toBeDefined();
+    expect(fromC).toBeDefined();
+    const misattributed = calls.find(
+      (c) =>
+        c.rel.sourceId === 'Method:src/M3.java:M3$1.hook#0' &&
+        c.rel.targetId === 'Method:src/M3.java:M3.log#0',
+    );
+    expect(misattributed).toBeUndefined();
+  }, 60000);
+});
+
+// ---------------------------------------------------------------------------
+// #2561: E.CONST.method() emits no CALLS edge — the receiver-side follow-up
+// to #2555. A bodied constant's receiver must resolve to its synthesized
+// E$N class; a body-less constant's receiver must resolve to the host enum
+// itself.
+// ---------------------------------------------------------------------------
+
+describe('Java enum-constant receiver dispatch (#2561)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'java-enum-constant-body'), () => {});
+  }, 60000);
+
+  it('resolves EnumConst.A.hook() to the bodied constant override (EnumConst$1.hook#0)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const dispatch = calls.find((c) => c.source === 'dispatchToConstant' && c.target === 'hook');
+    expect(dispatch).toBeDefined();
+    expect(dispatch!.rel.targetId).toBe('Method:src/EnumConst.java:EnumConst$1.hook#0');
+  });
+
+  it("resolves EnumConst.A.log() to the host enum's inherited method via E$N's MRO (EnumConst.log#0)", () => {
+    // A's body overrides hook() but NOT log(); log() lives only on the enum.
+    // The bodied constant's receiver binds to EnumConst$1, whose MRO includes
+    // EnumConst (via @reference.inherits), so the qualified call reaches the
+    // host enum's own method — the inherited-dispatch capability the fix enables.
+    const calls = getRelationships(result, 'CALLS');
+    const dispatch = calls.find((c) => c.source === 'dispatchInherited' && c.target === 'log');
+    expect(dispatch).toBeDefined();
+    expect(dispatch!.rel.targetId).toBe('Method:src/EnumConst.java:EnumConst.log#0');
+  });
+
+  it("resolves Plain.A.m() to the body-less constant's inherited enum method (Plain.m#0)", () => {
+    const calls = getRelationships(result, 'CALLS');
+    const dispatch = calls.find((c) => c.source === 'callPlain' && c.target === 'm');
+    expect(dispatch).toBeDefined();
+    expect(dispatch!.rel.targetId).toBe('Method:src/Plain.java:Plain.m#0');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Program boundary vs. analysis uncertainty (#2744).
+//
+// The origin classifier's only source of positive EXTERNAL evidence is
+// `LanguageProvider.isBuiltInName`. Java declared no built-in set, so no Java
+// drop could ever be judged external and every one of them hedged `impact()`
+// down to `epistemic: 'lower-bound'` — safe, but it left the language unable to
+// name its own boundary. This exercises the whole wiring end to end (provider →
+// `runScopeResolution` → pass options → classifier → drop record), which the
+// classifier unit tests deliberately do not.
+// ---------------------------------------------------------------------------
+
+describe('Java receiver-unresolved drops name the program boundary (#2744)', () => {
+  let repoDir: string;
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gn-java-receiver-origin-'));
+    writeFixtureRepo(repoDir, {
+      'src/Boundary.java': `public class Boundary {
+    public void platform(String raw) {
+        // Rooted at \`System\`, which the language itself names. Nothing was
+        // lost: no node in this index could have been the target.
+        System.out.println(raw);
+    }
+
+    public void unknownReceiver(OrderRepository repo) {
+        // \`OrderRepository\` is declared nowhere here and is not a platform
+        // name. Absence of evidence is not evidence of externality — this must
+        // stay hedged, or a genuinely missing in-program caller gets published
+        // as \`exact\`. Spelled as a CHAIN on purpose: a bare \`repo.findAll()\`
+        // never reaches the drop recorder at all (the pass takes a different
+        // arm and records nothing), so it would assert on an empty set.
+        repo.find().save();
+    }
+}
+`,
+    });
+    result = await runPipelineFromRepo(repoDir, () => {}, {});
+  }, 60000);
+
+  afterAll(() => {
+    if (repoDir !== undefined) fs.rmSync(repoDir, { recursive: true, force: true });
+  });
+
+  it('marks a System.out.println(...) drop external', () => {
+    const drops = getResolutionOutcomes(result).filter(
+      (outcome) => outcome.kind === 'suppressed' && outcome.reason === 'receiver-unresolved',
+    );
+    expect(drops).toContainEqual(
+      expect.objectContaining({ name: 'println', siteKind: 'call', receiverOrigin: 'external' }),
+    );
+  });
+
+  it('does not mark a drop on an undeclared user receiver external', () => {
+    const drops = getResolutionOutcomes(result).filter(
+      (outcome) => outcome.kind === 'suppressed' && outcome.reason === 'receiver-unresolved',
+    );
+    expect(drops).toContainEqual(
+      expect.objectContaining({ name: 'save', siteKind: 'call', receiverOrigin: 'unknown' }),
+    );
+    expect(drops).not.toContainEqual(
+      expect.objectContaining({ name: 'save', receiverOrigin: 'external' }),
+    );
   });
 });

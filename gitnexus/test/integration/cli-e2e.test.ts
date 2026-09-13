@@ -210,8 +210,10 @@ function runEvalServerHostFlagTest(
   spawnArgs: string[],
   opts: {
     timeoutMsg: string;
+    extraEnv?: Record<string, string>;
     onStdout: (params: {
       stdoutBuffer: string;
+      stderrBuffer: string;
       isSettled: () => boolean;
       settle: (fn: () => void) => void;
       resolve: () => void;
@@ -223,7 +225,7 @@ function runEvalServerHostFlagTest(
     const child = spawn(process.execPath, [...CLI_SPAWN_PREFIX, 'eval-server', ...spawnArgs], {
       cwd: MINI_REPO,
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: cliEnv(),
+      env: cliEnv(opts.extraEnv),
     });
 
     let stdoutBuffer = '';
@@ -255,6 +257,7 @@ function runEvalServerHostFlagTest(
       try {
         await opts.onStdout({
           stdoutBuffer,
+          stderrBuffer,
           isSettled: () => settled,
           settle,
           resolve,
@@ -1045,6 +1048,203 @@ describe('CLI end-to-end', () => {
       expect(result.stdout).toMatch(/analyze|status|serve/i);
     });
 
+    it('shows the analyze watch mode and its debounce controls', () => {
+      const result = runCliRaw(['analyze', '--help'], MINI_REPO);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain('--watch');
+      expect(result.stdout).toContain('--debounce');
+      expect(result.stdout).toContain('--workers');
+    });
+
+    it('rejects --debounce without --watch', () => {
+      const result = runCliRaw(['analyze', '--debounce', '25'], MINI_REPO);
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('--debounce requires --watch');
+    });
+
+    it('runs production analyze --watch with exact telemetry and transactional config reloads', async () => {
+      const repo = makeMiniRepoCopy('watch-repo', 'gn-watch-cli-');
+      const home = fs.mkdtempSync(path.join(os.tmpdir(), 'gn-watch-cli-home-'));
+      try {
+        fs.writeFileSync(
+          path.join(repo, '.gitnexusrc'),
+          JSON.stringify({ workers: '1', maxFileSize: '1' }),
+          'utf8',
+        );
+        await new Promise<void>((resolve, reject) => {
+          const child = spawn(
+            process.execPath,
+            [...CLI_SPAWN_PREFIX, 'analyze', repo, '--watch', '--debounce', '25', '--workers', '1'],
+            {
+              cwd: repo,
+              stdio: ['ignore', 'pipe', 'pipe'],
+              env: cliEnv({ GITNEXUS_HOME: home }),
+            },
+          );
+          let stdout = '';
+          let stderr = '';
+          let transcript = '';
+          let baselineNodes: number | undefined;
+          let stage = 'ready';
+          let stageOffset = 0;
+          let settled = false;
+          const timer = setTimeout(() => {
+            if (settled) return;
+            settled = true;
+            child.kill('SIGTERM');
+            reject(new Error(`watch CLI timed out\nstdout:\n${stdout}\nstderr:\n${stderr}`));
+          }, 480_000);
+
+          const advance = (nextStage: string, action: () => void) => {
+            stage = nextStage;
+            stageOffset = transcript.length;
+            setTimeout(action, 200);
+          };
+
+          const writeLargeSource = (fileName: string, functionName: string) => {
+            fs.writeFileSync(
+              path.join(repo, fileName),
+              `const padding = '${'x'.repeat(1_500)}';\n` +
+                `export function ${functionName}(): number { return padding.length; }\n`,
+              'utf8',
+            );
+          };
+
+          const handleOutput = () => {
+            const output = transcript.slice(stageOffset);
+            if (stage === 'ready' && /Watching .*index (?:is up to date|ready)/.test(output)) {
+              const meta = JSON.parse(
+                fs.readFileSync(path.join(repo, '.gitnexus', 'gitnexus.json'), 'utf8'),
+              );
+              baselineNodes = meta.stats.nodes;
+              advance('proof', () => {
+                fs.writeFileSync(
+                  path.join(repo, 'watch-proof.ts'),
+                  'export function watchProof(): number { return 1; }\n',
+                  'utf8',
+                );
+              });
+              return;
+            }
+            if (
+              stage === 'proof' &&
+              /Refresh complete: 1 changed, 1 re-parsed, 0 affected dependent\(s\)/.test(output)
+            ) {
+              const meta = JSON.parse(
+                fs.readFileSync(path.join(repo, '.gitnexus', 'gitnexus.json'), 'utf8'),
+              );
+              expect(meta.stats.nodes).toBeGreaterThan(baselineNodes!);
+              advance('first-large-file', () =>
+                writeLargeSource('oversized-before.ts', 'skippedByLimit'),
+              );
+              return;
+            }
+            if (
+              stage === 'first-large-file' &&
+              output.includes('Skipped 1 large files (>1KB)') &&
+              output.includes('- oversized-before.ts') &&
+              /Refresh complete: 0 changed,/.test(output)
+            ) {
+              advance('invalid-config', () => {
+                fs.writeFileSync(
+                  path.join(repo, '.gitnexusrc'),
+                  JSON.stringify({ workers: '1', maxFileSize: '0' }),
+                  'utf8',
+                );
+              });
+              return;
+            }
+            if (
+              stage === 'invalid-config' &&
+              /Refresh failed.*maxFileSize must be a positive integer/.test(output)
+            ) {
+              advance('second-large-file', () =>
+                writeLargeSource('oversized-after-invalid.ts', 'stillSkipped'),
+              );
+              return;
+            }
+            if (
+              stage === 'second-large-file' &&
+              /Refresh failed.*Configuration remains invalid/.test(output)
+            ) {
+              advance('recovered-config', () => {
+                fs.writeFileSync(
+                  path.join(repo, '.gitnexusrc'),
+                  JSON.stringify({ workers: '1', maxFileSize: '4096' }),
+                  'utf8',
+                );
+              });
+              return;
+            }
+            if (
+              stage === 'recovered-config' &&
+              /Refresh complete: [2-9][0-9]* changed, [1-9][0-9]* re-parsed,/.test(output)
+            ) {
+              stage = 'stopping';
+              setTimeout(() => child.kill('SIGTERM'), 100);
+            }
+          };
+          child.stderr.on('data', (chunk: Buffer) => {
+            const text = chunk.toString();
+            stderr += text;
+            transcript += text;
+            handleOutput();
+          });
+          child.stdout.on('data', (chunk: Buffer) => {
+            const text = chunk.toString();
+            stdout += text;
+            transcript += text;
+            handleOutput();
+          });
+          child.once('error', (error) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            reject(error);
+          });
+          child.once('close', (code, signal) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            const expectedWindowsTermination =
+              process.platform === 'win32' && code === null && signal === 'SIGTERM';
+            if (code !== 0 && !expectedWindowsTermination) {
+              reject(
+                new Error(
+                  `watch CLI exited ${code ?? signal}\nstdout:\n${stdout}\nstderr:\n${stderr}`,
+                ),
+              );
+              return;
+            }
+            expect(stage).toBe('stopping');
+            expect(transcript).toContain(
+              'Refresh complete: 1 changed, 1 re-parsed, 0 affected dependent(s)',
+            );
+            resolve();
+          });
+        });
+
+        for (const [symbol, file] of [
+          ['watchProof', 'watch-proof.ts'],
+          ['skippedByLimit', 'oversized-before.ts'],
+          ['stillSkipped', 'oversized-after-invalid.ts'],
+        ]) {
+          const result = runCliWithEnv(
+            ['context', symbol, '--file', file],
+            repo,
+            { GITNEXUS_HOME: home },
+            30_000,
+          );
+          expect(result.status).toBe(0);
+          expect(result.stdout).toContain(symbol);
+          expect(result.stdout).toContain(file);
+        }
+      } finally {
+        cleanupTempDirSync(path.dirname(repo));
+        cleanupTempDirSync(home);
+      }
+    }, 540_000);
+
     it('fails with unknown command', () => {
       const result = runCliRaw(['nonexistent'], MINI_REPO);
 
@@ -1147,6 +1347,7 @@ describe('CLI end-to-end', () => {
       expect(result.stdout).toContain('--provider <provider>');
       expect(result.stdout).toContain('claude');
       expect(result.stdout).toContain('codex');
+      expect(result.stdout).toContain('grok');
       expect(result.stdout).toContain('--review');
       expect(result.stdout).toContain('-v, --verbose');
       expect(result.stdout).toContain('--model <model>');
@@ -1221,6 +1422,14 @@ describe('CLI end-to-end', () => {
 
     it('wiki --provider codex without API key does not prompt for key in non-TTY', () => {
       const result = runCliRaw(['wiki', MINI_REPO, '--provider', 'codex'], repoRoot, 15000);
+      if (result.status === null) return;
+
+      const combined = result.stdout + result.stderr;
+      expect(combined).not.toMatch(/API key:/);
+    });
+
+    it('wiki --provider grok without API key does not prompt for key in non-TTY', () => {
+      const result = runCliRaw(['wiki', MINI_REPO, '--provider', 'grok'], repoRoot, 15000);
       if (result.status === null) return;
 
       const combined = result.stdout + result.stderr;
@@ -1416,10 +1625,25 @@ describe('CLI end-to-end', () => {
   // Original flag registration test by Val Vladescu (PR #1602).
 
   describe('eval-server --host flag', { retry: 2 }, () => {
+    it('refuses an unauthenticated non-loopback bind before emitting READY', () => {
+      const result = runCliWithEnv(
+        ['eval-server', '--port', '0', '--host', '0.0.0.0', '--idle-timeout', '3'],
+        MINI_REPO,
+        { GITNEXUS_AUTH_TOKEN: '' },
+        30000,
+      );
+      const output = `${result.stdout}\n${result.stderr}`;
+
+      expect(result.status).toBe(1);
+      expect(output).toMatch(/non-loopback.*GITNEXUS_AUTH_TOKEN/is);
+      expect(output).not.toContain('GITNEXUS_EVAL_SERVER_READY:');
+    }, 35000);
+
     it('emits READY signal containing the bound host 127.0.0.1', () => {
       return runEvalServerHostFlagTest(
         ['--port', '0', '--host', '127.0.0.1', '--idle-timeout', '3'],
         {
+          extraEnv: { GITNEXUS_AUTH_TOKEN: '' },
           timeoutMsg: 'eval-server did not emit READY signal within 30s',
           onStdout({ stdoutBuffer, settle, resolve, reject }) {
             if (!stdoutBuffer.includes('GITNEXUS_EVAL_SERVER_READY:')) return;
@@ -1439,12 +1663,26 @@ describe('CLI end-to-end', () => {
       );
     }, 35000);
 
-    it('binds to 0.0.0.0 and serves /health on 127.0.0.1 (cross-container use case)', () => {
+    it('binds to ::1 without a token when IPv6 loopback is available', () => {
+      return runEvalServerHostFlagTest(['--port', '0', '--host', '::1', '--idle-timeout', '3'], {
+        extraEnv: { GITNEXUS_AUTH_TOKEN: '' },
+        timeoutMsg: 'eval-server --host ::1 did not emit READY signal within 30s',
+        onStdout({ stdoutBuffer, settle, resolve }) {
+          if (stdoutBuffer.includes('GITNEXUS_EVAL_SERVER_READY:[::1]:')) {
+            settle(resolve);
+          }
+        },
+      });
+    }, 35000);
+
+    it('requires the configured bearer token on a 0.0.0.0 bind', () => {
+      const authToken = 'integration-secret-token';
       return runEvalServerHostFlagTest(
         ['--port', '0', '--host', '0.0.0.0', '--idle-timeout', '3'],
         {
+          extraEnv: { GITNEXUS_AUTH_TOKEN: authToken },
           timeoutMsg: 'eval-server --host 0.0.0.0 did not emit READY signal within 30s',
-          async onStdout({ stdoutBuffer, isSettled, settle, resolve, reject }) {
+          async onStdout({ stdoutBuffer, stderrBuffer, isSettled, settle, resolve, reject }) {
             const readyLine = stdoutBuffer
               .split('\n')
               .find((l) => l.startsWith('GITNEXUS_EVAL_SERVER_READY:0.0.0.0:'));
@@ -1459,19 +1697,42 @@ describe('CLI end-to-end', () => {
               return;
             }
 
-            // A server bound to 0.0.0.0 must be reachable on 127.0.0.1 from the same host
             try {
-              const res = await fetch(`http://127.0.0.1:${boundPort}/health`);
-              if (res.status === 200) {
+              const url = `http://127.0.0.1:${boundPort}/health`;
+              const missing = await fetch(url);
+              const wrong = await fetch(url, {
+                headers: { Authorization: 'Bearer wrong-token' },
+              });
+              const correct = await fetch(url, {
+                headers: { Authorization: `Bearer ${authToken}` },
+              });
+              const responseText = `${await missing.text()}${await wrong.text()}${await correct.text()}`;
+
+              if (
+                missing.status === 401 &&
+                wrong.status === 401 &&
+                correct.status === 200 &&
+                missing.headers.get('www-authenticate') === 'Bearer' &&
+                wrong.headers.get('www-authenticate') === 'Bearer' &&
+                !responseText.includes(authToken) &&
+                !stdoutBuffer.includes(authToken) &&
+                !stderrBuffer.includes(authToken)
+              ) {
                 settle(resolve);
               } else {
-                settle(() => reject(new Error(`/health returned ${res.status}, expected 200`)));
+                settle(() =>
+                  reject(
+                    new Error(
+                      `/health auth statuses were ${missing.status}/${wrong.status}/${correct.status}; expected 401/401/200`,
+                    ),
+                  ),
+                );
               }
             } catch (err) {
               settle(() =>
                 reject(
                   new Error(
-                    `eval-server bound to 0.0.0.0 but /health unreachable on 127.0.0.1:${boundPort}: ${err}`,
+                    `authenticated eval-server health probe failed on 127.0.0.1:${boundPort}: ${err}`,
                   ),
                 ),
               );
@@ -1485,6 +1746,7 @@ describe('CLI end-to-end', () => {
       return runEvalServerHostFlagTest(
         ['--port', '0', '--host', 'localhost', '--idle-timeout', '3'],
         {
+          extraEnv: { GITNEXUS_AUTH_TOKEN: '' },
           timeoutMsg: 'eval-server --host localhost did not emit READY signal within 30s',
           async onStdout({ stdoutBuffer, isSettled, settle, resolve, reject }) {
             const readyLine = stdoutBuffer

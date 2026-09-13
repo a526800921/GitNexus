@@ -19,10 +19,13 @@ import {
 } from '../../src/server/analyze-worker-core.js';
 import type { AnalyzeResult } from '../../src/core/run-analyze.js';
 import type { WorkerMessage } from '../../src/server/analyze-worker.js';
+import type { AnalyzerRunnerIdentity } from '../../src/storage/repo-manager.js';
+import { IndexLockTimeoutError, type LockRecord } from '../../src/storage/index-lock.js';
 
 const baseResult: AnalyzeResult = {
   repoName: 'repo',
   repoPath: '/repo',
+  storagePath: '/repo/.gitnexus',
   stats: {},
   alreadyUpToDate: false,
   ftsRepairedOnly: false,
@@ -75,6 +78,27 @@ describe('runWorkerAnalysis — finalize guard (#2264 P2)', () => {
 
     const completes = send.mock.calls.filter((c) => c[0].type === 'complete');
     expect(completes).toHaveLength(1);
+    expect(okFinalize).toHaveBeenCalledWith('/repo', '/repo/.gitnexus');
+  });
+
+  it('threads the pre-import runner receipt into runFullAnalysis', async () => {
+    const send = vi.fn<(msg: WorkerMessage) => void>();
+    const run = vi.fn<WorkerAnalysisDeps['runFullAnalysis']>(async () => baseResult);
+    const receipt = { schemaVersion: 4 } as AnalyzerRunnerIdentity;
+
+    await runWorkerAnalysis(
+      '/repo',
+      {},
+      {
+        runFullAnalysis: run,
+        assertAnalysisFinalized: okFinalize,
+        send,
+        claimTerminal: alwaysClaim,
+      },
+      receipt,
+    );
+
+    expect(run.mock.calls[0]?.[3]).toBe(receipt);
   });
 
   it('reports error when finalization passes but the analysis itself throws', async () => {
@@ -100,6 +124,49 @@ describe('runWorkerAnalysis — finalize guard (#2264 P2)', () => {
     expect(send).toHaveBeenCalledWith({ type: 'error', message: 'boom' });
     expect(finalize).not.toHaveBeenCalled();
   });
+
+  it.each([undefined, '/repo/.gitnexus/analyze.lock.guard'])(
+    'classifies lock timeout retryability for guard=%s',
+    async (guardPath) => {
+      const send = vi.fn<(msg: WorkerMessage) => void>();
+      const holder: LockRecord = {
+        v: 1,
+        pid: -1,
+        hostname: 'host',
+        startTime: null,
+        token: '',
+        invocationId: 'unknown',
+        acquiredAt: '',
+      };
+      const lockContended: WorkerAnalysisDeps['runFullAnalysis'] = vi.fn(async () => {
+        throw new IndexLockTimeoutError(holder, 600_000, false, guardPath);
+      });
+
+      await runWorkerAnalysis(
+        '/repo',
+        {},
+        {
+          runFullAnalysis: lockContended,
+          assertAnalysisFinalized: okFinalize,
+          send,
+          claimTerminal: alwaysClaim,
+        },
+      );
+
+      expect(send).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'error',
+          code: 'index-lock-timeout',
+          retryable: guardPath === undefined,
+        }),
+      );
+      if (guardPath) {
+        expect(send).toHaveBeenCalledWith(
+          expect.objectContaining({ message: expect.stringContaining('quiesced recovery') }),
+        );
+      }
+    },
+  );
 });
 
 describe('runWorkerAnalysis — terminal-claim coordination (#2264 P3)', () => {

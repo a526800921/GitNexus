@@ -13,26 +13,32 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { execSync } from 'child_process';
 import fs from 'fs/promises';
 import path from 'path';
+import { pathToFileURL } from 'url';
 
 type RepoManagerModule = typeof import('../../src/storage/repo-manager.js');
 
 const rmCtx = vi.hoisted(() => ({
   adoptMock: vi.fn(),
   saveMetaMock: vi.fn(),
+  writableMock: vi.fn(),
   realAdopt: null as RepoManagerModule['adoptFlatBranchLabel'] | null,
   realSaveMeta: null as RepoManagerModule['saveMeta'] | null,
+  realEnsureWritable: null as RepoManagerModule['ensureStoragePathWritable'] | null,
 }));
 
 vi.mock('../../src/storage/repo-manager.js', async (importOriginal) => {
   const actual = await importOriginal<RepoManagerModule>();
   rmCtx.realAdopt = actual.adoptFlatBranchLabel;
   rmCtx.realSaveMeta = actual.saveMeta;
+  rmCtx.realEnsureWritable = actual.ensureStoragePathWritable;
   rmCtx.adoptMock.mockImplementation(actual.adoptFlatBranchLabel);
   rmCtx.saveMetaMock.mockImplementation(actual.saveMeta);
+  rmCtx.writableMock.mockImplementation(actual.ensureStoragePathWritable);
   return {
     ...actual,
     adoptFlatBranchLabel: rmCtx.adoptMock,
     saveMeta: rmCtx.saveMetaMock,
+    ensureStoragePathWritable: rmCtx.writableMock,
   };
 });
 
@@ -40,11 +46,13 @@ import {
   getStoragePaths,
   registerRepo,
   loadMeta,
-  INCREMENTAL_SCHEMA_VERSION,
   type RepoMeta,
 } from '../../src/storage/repo-manager.js';
+import { SCHEMA_FINGERPRINT } from '../../src/core/lbug/schema.js';
 import { runFullAnalysis } from '../../src/core/run-analyze.js';
+import { resolveAnalyzerRunnerIdentity } from '../../src/core/analyzer-identity.js';
 import { createTempDir } from '../helpers/test-db.js';
+import { CLASS_FRAMEWORK_ANNOTATIONS_FEATURE } from '../../src/core/analysis-features.js';
 
 describe('fast-path restamp failure modes (#2364 F3)', () => {
   let tmpHome: Awaited<ReturnType<typeof createTempDir>>;
@@ -58,11 +66,16 @@ describe('fast-path restamp failure modes (#2364 F3)', () => {
     process.env.GITNEXUS_HOME = tmpHome.dbPath;
     rmCtx.adoptMock.mockReset();
     rmCtx.saveMetaMock.mockReset();
+    rmCtx.writableMock.mockReset();
     rmCtx.adoptMock.mockImplementation(
       (...args: Parameters<RepoManagerModule['adoptFlatBranchLabel']>) => rmCtx.realAdopt!(...args),
     );
     rmCtx.saveMetaMock.mockImplementation((...args: Parameters<RepoManagerModule['saveMeta']>) =>
       rmCtx.realSaveMeta!(...args),
+    );
+    rmCtx.writableMock.mockImplementation(
+      (...args: Parameters<RepoManagerModule['ensureStoragePathWritable']>) =>
+        rmCtx.realEnsureWritable!(...args),
     );
   });
 
@@ -89,12 +102,19 @@ describe('fast-path restamp failure modes (#2364 F3)', () => {
       cwd: tmpRepo.dbPath,
       encoding: 'utf-8',
     }).trim();
+    const runnerIdentity = resolveAnalyzerRunnerIdentity(
+      pathToFileURL(path.resolve(__dirname, '../../src/core/run-analyze.ts')).href,
+    );
     const metaFor = (branch: string): RepoMeta => ({
       repoPath: tmpRepo.dbPath,
       lastCommit: commit,
       indexedAt: new Date().toISOString(),
       branch,
-      schemaVersion: INCREMENTAL_SCHEMA_VERSION,
+      schemaFingerprint: SCHEMA_FINGERPRINT,
+      analysisFeatures: {
+        [CLASS_FRAMEWORK_ANNOTATIONS_FEATURE.id]: CLASS_FRAMEWORK_ANNOTATIONS_FEATURE.version,
+      },
+      runnerIdentity,
     });
     const flat = getStoragePaths(tmpRepo.dbPath);
     await rmCtx.realSaveMeta!(flat.storagePath, metaFor('main'));
@@ -160,4 +180,26 @@ describe('fast-path restamp failure modes (#2364 F3)', () => {
       expect(meta?.branch).toBe('main');
     },
   );
+
+  it('does not require writable storage for an already-up-to-date run', async () => {
+    await seedFlippedWorkspace();
+    rmCtx.writableMock.mockRejectedValueOnce(
+      Object.assign(new Error('mock read-only storage'), { code: 'EROFS' }),
+    );
+
+    const result = await runFullAnalysis(tmpRepo.dbPath, {}, {});
+
+    expect(result.alreadyUpToDate).toBe(true);
+    expect(rmCtx.writableMock).not.toHaveBeenCalled();
+  });
+
+  it('still requires writable storage when an up-to-date checkout has content changes', async () => {
+    const { flatStorage } = await seedFlippedWorkspace();
+    await fs.writeFile(path.join(tmpRepo.dbPath, 'dirty.ts'), 'export const dirty = true;\n');
+    const readOnly = Object.assign(new Error('mock read-only storage'), { code: 'EROFS' });
+    rmCtx.writableMock.mockRejectedValueOnce(readOnly);
+
+    await expect(runFullAnalysis(tmpRepo.dbPath, {}, {})).rejects.toBe(readOnly);
+    expect(rmCtx.writableMock).toHaveBeenCalledWith(flatStorage);
+  });
 });

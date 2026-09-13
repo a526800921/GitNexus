@@ -8,29 +8,42 @@ import {
   templateArgumentsIdTag,
 } from './template-arguments.js';
 import { splitQualifiedName } from './qualified-name.js';
+import { isOverloadableCallable } from './callable-labels.js';
 
 /** Tree-sitter AST node. Re-exported for use across ingestion modules. */
 export type SyntaxNode = Parser.SyntaxNode;
 
 /**
- * Qualify a Rust inherent-impl target (`impl Inner { ... }`) by its enclosing
- * `mod_item` scope, so a bare same-tail target nested under different modules
- * resolves to a DISTINCT path (`outer.Inner` vs `other.Inner`) — the #1982
- * follow-up to #1975. Walks `mod_item` ancestors (outermost → innermost) and
- * joins them with the normalized raw target via the shared `splitQualifiedName`.
- * A top-level `impl Inner` (no enclosing mod) returns the bare target unchanged.
- * Keyed purely on tree-sitter node types (no language name), matching the
- * inherent-impl branch in `findEnclosingClassInfo`; the caller restricts this to
- * UNSCOPED targets (`type_identifier`) so a SCOPED `impl a::Inner` keeps its full
- * raw text (#1975). The Impl-node materialization in parsing-processor /
- * parse-worker mirrors this so the owner edge and node id agree byte-for-byte.
+ * Qualify a name by its enclosing `mod_item` scope, so two same-tail items nested
+ * under different modules get DISTINCT paths (`outer.Inner` vs `other.Inner`).
+ * Walks `mod_item` ancestors (outermost → innermost) and joins them with the
+ * normalized raw text via the shared `splitQualifiedName`. Keyed purely on
+ * tree-sitter node types (no language name), so it is a no-op for every grammar
+ * without such a node.
+ *
+ * TWO callers, with different contracts — read both before widening either:
+ *
+ *  1. The inherent-impl target (`impl Inner { … }`) — the #1982 follow-up to
+ *     #1975, reachable through the {@link qualifyRustImplTargetByModScope} alias
+ *     and mirrored by the inherent-impl branch in `findEnclosingClassInfo` so the
+ *     owner edge and the node id agree byte-for-byte. That caller gates on an
+ *     UNSCOPED `type_identifier`, which is what keeps a SCOPED `impl a::Inner` on
+ *     its full raw text.
+ *
+ *  2. Free items, for module node identity (#2742). That caller gates on the node
+ *     being on neither side of an owner edge (`MEMBER_OWNER_NODE_TYPES`,
+ *     `enclosingClassInfo`) and not inside a callable, because only the id moves
+ *     here — every owner-edge anchor is minted separately and does not follow.
+ *
+ * A name with NO enclosing `mod` is returned verbatim, never normalized: rewriting
+ * a scoped target's separator (`a::Inner` → `a.Inner`) would move its node id away
+ * from the id its owner edge emits, which is how caller 2 first broke caller 1's
+ * #1975 contract. Splitting an unscoped name has always been the identity, so
+ * caller 1 is unaffected either way.
  */
-export const qualifyRustImplTargetByModScope = (
-  implNode: SyntaxNode,
-  rawTargetText: string,
-): string => {
+export const qualifyByEnclosingModScope = (node: SyntaxNode, rawText: string): string => {
   const modSegments: string[] = [];
-  let current = implNode.parent;
+  let current = node.parent;
   while (current) {
     if (current.type === 'mod_item') {
       const nameNode =
@@ -40,8 +53,21 @@ export const qualifyRustImplTargetByModScope = (
     }
     current = current.parent;
   }
-  return [...modSegments, ...splitQualifiedName(rawTargetText)].filter(Boolean).join('.');
+  // No enclosing `mod`: return the raw text UNTOUCHED. Normalizing here would
+  // rewrite a scoped target's separator (`a::Inner` -> `a.Inner`) and silently
+  // move its node id away from the one the owner edge emits, which is how this
+  // helper first broke the #1975 scoped-impl ownership when it was generalized
+  // beyond unscoped targets. Callers that pass an unscoped name are unaffected,
+  // since splitting one has always been the identity.
+  if (modSegments.length === 0) return rawText;
+  return [...modSegments, ...splitQualifiedName(rawText)].filter(Boolean).join('.');
 };
+
+/**
+ * Impl-target alias of {@link qualifyByEnclosingModScope}, kept as its own name
+ * because the caller gates it on UNSCOPED targets (see the contract above).
+ */
+export const qualifyRustImplTargetByModScope = qualifyByEnclosingModScope;
 
 /**
  * #1991: scope-label predicate that single-sources the `nodeLabel === 'Trait'`
@@ -110,24 +136,6 @@ const isConcreteTypedefCapture = (captureMap: Record<string, SyntaxNode>): boole
   );
 };
 
-export const buildConcreteTypedefDefinitionRanges = (
-  matches: readonly QueryMatchLike[],
-): Set<string> => {
-  const ranges = new Set<string>();
-  for (const match of matches) {
-    const captureMap: Record<string, SyntaxNode> = {};
-    for (const capture of match.captures) {
-      captureMap[capture.name] = capture.node;
-    }
-
-    const definitionNode = getDefinitionNodeFromCaptures(captureMap);
-    if (definitionNode && isConcreteTypedefCapture(captureMap)) {
-      ranges.add(nodeRangeKey(definitionNode));
-    }
-  }
-  return ranges;
-};
-
 export const isSuppressedConcreteTypedefDuplicate = (
   captureMap: Record<string, SyntaxNode>,
   concreteTypedefRanges: ReadonlySet<string>,
@@ -138,6 +146,129 @@ export const isSuppressedConcreteTypedefDuplicate = (
     captureMap['definition.typedef'] !== undefined &&
     concreteTypedefRanges.has(nodeRangeKey(definitionNode))
   );
+};
+
+/**
+ * Graph labels produced by a value capture (`@definition.const` /
+ * `@definition.static` / `@definition.variable`) — a binding that holds a value.
+ *
+ * `Property` is deliberately NOT here. It outranks these: Python matches both
+ * `@definition.property` (annotated) and `@definition.variable` (bare) on one
+ * assignment, and the property must win so a typed class attribute keeps its
+ * `Property` node and its owning `HAS_PROPERTY` edge. `Property` is instead
+ * suppressed only by a *callable* claim — see {@link buildDefinitionNameClaims}.
+ */
+const VALUE_DEFINITION_LABELS: ReadonlySet<NodeLabel> = new Set<NodeLabel>([
+  'Const',
+  'Static',
+  'Variable',
+]);
+
+/** True when `label` is the kind of node a value capture emits. */
+export const isValueDefinitionLabel = (label: NodeLabel): boolean =>
+  VALUE_DEFINITION_LABELS.has(label);
+
+/**
+ * One pass over a file's matches: definition-name claims by rank, plus the
+ * concrete-typedef ranges the loop's separate typedef guard consumes.
+ */
+export interface DefinitionPreScan {
+  /**
+   * Keys claimed by any non-value capture — consulted by `Const`/`Static`/
+   * `Variable`. Includes `Property`, so an annotated Python attribute still
+   * beats the bare-assignment `Variable` capture on the same statement.
+   */
+  readonly nonValue: ReadonlySet<string>;
+  /**
+   * Keys claimed by a *callable* capture (`Function`/`Method`/`Constructor`) —
+   * consulted by `Property`. Narrower than `nonValue` on purpose: a `Property`
+   * must be collapsible by a callable (Kotlin `val f = { … }`, Swift
+   * `let f = { … }`) without being collapsible by its own claim.
+   */
+  readonly callable: ReadonlySet<string>;
+  /** Ranges of `type_definition` nodes that already emit a concrete struct/enum. */
+  readonly concreteTypedefRanges: ReadonlySet<string>;
+}
+
+/**
+ * Pre-scan `matches` for the `${definitionNode.startIndex}:${name}` keys already
+ * claimed by a higher-ranked definition capture, so the parse-worker's duplicate
+ * suppression is order-independent.
+ *
+ * Rank, highest first: callable (`Function`/`Method`/`Constructor`) → `Property`
+ * → value (`Const`/`Static`/`Variable`). A capture is dropped only when a
+ * STRICTLY higher rank claimed the same declaration node and name, so no capture
+ * can suppress itself and no rank can suppress a peer.
+ *
+ * ## Why this exists (#2687)
+ *
+ * `const X = () => {}` matches BOTH `@definition.function` and
+ * `@definition.const` on the same `lexical_declaration`. Only one graph node
+ * should survive — the `Function`, because that is what `CALLS` edges target.
+ * The parse-worker's in-loop dedup intends exactly that, but only the value
+ * branch consults its `processedDefinitionNodes` set, so suppression worked only
+ * if the function match happened to be processed first. It is not: tree-sitter
+ * completes the const pattern at `@name`, while the function pattern must also
+ * match the trailing `(arrow_function)` / `(function_expression)` value, so the
+ * const match is yielded FIRST and the edgeless `Const:` twin escaped.
+ *
+ * Consulting this set makes the outcome independent of match order.
+ *
+ * ## Keying
+ *
+ * Keys are `startIndex:name`, never `startIndex` alone — a multi-name
+ * declaration (`const a = 1, b = () => {}`) shares ONE definition node, and a
+ * bare-index key would wrongly suppress `a`'s legitimate `Const` node.
+ *
+ * Labels come from {@link getLabelFromCaptures}, the same function the main loop
+ * uses, so the pre-scan and the loop can never disagree about what counts as a
+ * value capture — including when a provider's `labelOverride` reclassifies one.
+ * A match that resolves to a value label registers nothing, so a match can never
+ * suppress itself.
+ *
+ * Language-agnostic: keyed off capture names and labels only.
+ *
+ * Also collects the concrete-typedef ranges that suppress the analogous
+ * typedef/struct duplicate, so both suppression sets come from one traversal.
+ */
+export const buildDefinitionPreScan = (
+  matches: readonly QueryMatchLike[],
+  provider: LanguageProvider,
+): DefinitionPreScan => {
+  const nonValue = new Set<string>();
+  const callable = new Set<string>();
+  const concreteTypedefRanges = new Set<string>();
+  for (const match of matches) {
+    // ONE capture-map build per match feeds both suppression sets. These used
+    // to be two independent passes over `matches` (each rebuilding this object)
+    // on the hot per-file parse path.
+    const captureMap: Record<string, SyntaxNode> = {};
+    for (const capture of match.captures) {
+      captureMap[capture.name] = capture.node;
+    }
+
+    const definitionNode = getDefinitionNodeFromCaptures(captureMap);
+    if (definitionNode === null) continue;
+
+    if (isConcreteTypedefCapture(captureMap)) {
+      concreteTypedefRanges.add(nodeRangeKey(definitionNode));
+    }
+
+    // No `@name` capture means nothing a lower-ranked capture could collide
+    // with — a value or property pattern always binds a name. Checked before
+    // `getLabelFromCaptures` so a nameless match never pays for label
+    // resolution (which can reach a provider's `labelOverride`).
+    const nameNode = captureMap['name'];
+    if (nameNode === undefined) continue;
+
+    const label = getLabelFromCaptures(captureMap, provider);
+    if (label === null || isValueDefinitionLabel(label)) continue;
+
+    const key = `${definitionNode.startIndex}:${nameNode.text}`;
+    nonValue.add(key);
+    if (isOverloadableCallable(label)) callable.add(key);
+  }
+  return { nonValue, callable, concreteTypedefRanges };
 };
 
 /**
@@ -190,6 +321,9 @@ export const FUNCTION_NODE_TYPES = new Set([
   // Dart
   'function_signature',
   'method_signature',
+  // Zig: `test "…" { }` bodies are callable scopes — calls inside attribute
+  // to the test, not the file. Named via methodExtractor.extractFunctionName.
+  'test_declaration',
 ]);
 
 /**
@@ -204,6 +338,15 @@ export const CLASS_CONTAINER_TYPES = new Set([
   'class_declaration',
   'abstract_class_declaration',
   'interface_declaration',
+  // A TypeScript object-type alias owns its members exactly as the interface
+  // beside it does — same `property_signature` members, same "who reads this
+  // contract field?" question. Without it an alias member is minted with a
+  // bare id and no owner, so two aliases in one file sharing a field name
+  // collapse onto one node and nothing links the field to its consumers,
+  // while the identical interface resolves. Aliases with no object type
+  // (`type Id = string`) declare no members, so they own nothing and are
+  // unaffected.
+  'type_alias_declaration',
   'struct_declaration',
   'record_declaration',
   'class_specifier',
@@ -230,12 +373,49 @@ export const CLASS_CONTAINER_TYPES = new Set([
   // Go
   'struct_type',
   'interface_type',
+  // Zig
+  'union_declaration',
+  'opaque_declaration',
+]);
+
+/**
+ * Node types whose OWN node id must not be re-keyed by an enclosing-scope
+ * qualifier (see {@link qualifyByEnclosingModScope}) unless the owner-edge
+ * anchor moves in the same change.
+ *
+ * These are the containers a member can be declared inside. Their members'
+ * `HAS_METHOD` / `HAS_PROPERTY` edges anchor on `findEnclosingClassInfo().classId`,
+ * which is minted from the container's bare `nameNode.text` further down this
+ * file and only follows a qualified shape when the provider opts in via
+ * `classExtractor.qualifiedNodeId`. So qualifying a container's id alone points
+ * every one of its member edges at a node that does not exist — the edges are
+ * dropped at COPY time and the container silently loses all its members.
+ *
+ * Derived from `CLASS_CONTAINER_TYPES` on purpose: that set is already the
+ * single source of "this node type owns member edges", carries the INVARIANT
+ * note above binding it to `CONTAINER_TYPE_TO_LABEL`, and so a language adding
+ * a container cannot gain a mismatched id shape here without also failing that
+ * invariant. Keyed purely on tree-sitter node types — no language names.
+ */
+export const MEMBER_OWNER_NODE_TYPES: ReadonlySet<string> = new Set<string>([
+  ...CLASS_CONTAINER_TYPES,
+  // Rust `union_item` owns a `field_declaration_list` exactly as `struct_item`
+  // does, and its fields ARE captured as `Property`, but it is absent from
+  // `CLASS_CONTAINER_TYPES`, so `findEnclosingClassInfo` does not recognize it as
+  // an owner: union fields carry no `HAS_PROPERTY` edge at all and therefore
+  // cannot dangle. Listed here so the union's own id keeps the same shape as the
+  // struct beside it, and so making it a real owner later starts from a
+  // consistent id rather than having to move one.
+  'union_item',
 ]);
 
 export const CONTAINER_TYPE_TO_LABEL: Record<string, string> = {
   class_declaration: 'Class',
   abstract_class_declaration: 'Class',
   interface_declaration: 'Interface',
+  // Required by the CLASS_CONTAINER_TYPES invariant above: a container missing
+  // here gets orphaned member edges or a wrong owner label.
+  type_alias_declaration: 'TypeAlias',
   struct_declaration: 'Struct',
   struct_specifier: 'Struct',
   class_specifier: 'Class',
@@ -249,7 +429,7 @@ export const CONTAINER_TYPE_TO_LABEL: Record<string, string> = {
   record_declaration: 'Record',
   protocol_declaration: 'Interface',
   mixin_declaration: 'Mixin',
-  extension_declaration: 'Extension',
+  extension_declaration: 'Class',
   class: 'Class',
   // Ruby `module` declarations map to `Trait` so they participate in the
   // class-like type registry used by `lookupClassByName` / inheritance
@@ -264,6 +444,12 @@ export const CONTAINER_TYPE_TO_LABEL: Record<string, string> = {
   companion_object: 'Class',
   struct_type: 'Struct',
   interface_type: 'Interface',
+  // Zig: tagged and untagged unions are class-like containers, and so is
+  // the fieldless `opaque {}` (may own methods; labelled Struct, see
+  // ZIG_QUERIES). `struct_declaration` and `enum_declaration` are already
+  // present (Dart / generic).
+  union_declaration: 'Union',
+  opaque_declaration: 'Struct',
 };
 
 /**
@@ -288,6 +474,25 @@ export function walkNamedTree(node: SyntaxNode, cb: (node: SyntaxNode) => void):
   }
 }
 
+/**
+ * True when a node is, or contains, tree-sitter error recovery.
+ *
+ * After a syntax error the parser keeps going by guessing node boundaries, so
+ * the surviving tree stays WELL FORMED while describing text that was never
+ * written that way: an unterminated argument list can absorb the source of the
+ * next declaration into an `ERROR` child, and an assignment with no right-hand
+ * side gets a `MISSING` value node whose text is invented. A capture that reads
+ * such a subtree emits facts that look ordinary and are false, which is worse
+ * than emitting nothing — so callers that record source text verbatim should
+ * check this first and fail closed.
+ *
+ * `hasError` covers the subtree; `isMissing` is checked as well because a node
+ * inserted by recovery is the one case where the node itself carries the flag.
+ */
+export function hasRecoveredSyntax(node: SyntaxNode): boolean {
+  return node.hasError || node.isMissing;
+}
+
 /** Return the first matching ancestor unless a boundary ancestor is reached first. */
 export function findAncestorBeforeBoundary(
   node: SyntaxNode,
@@ -304,6 +509,77 @@ export function findAncestorBeforeBoundary(
 }
 
 /**
+ * Enclosing callable for grammars that split a callable into a SIGNATURE node
+ * and a SIBLING body, where the callable is therefore never an ancestor of the
+ * code inside it.
+ *
+ * Dart is the case that forced this: `int outer() { … }` parses as
+ * `function_signature` followed by `function_body` as SIBLINGS, so an ancestor
+ * walk from a closure inside the body can never reach `outer`. No membership
+ * set fixes that — the walk is looking in the wrong direction (#2699).
+ *
+ * Deliberately a FALLBACK, used only when the ancestor walk found nothing.
+ *
+ * The sibling must be a BARE SIGNATURE, and that restriction is load-bearing —
+ * "any preceding callable sibling" is WRONG and was caught regressing PHP. In
+ * `<?php function target($x) {…} $handler = function ($x) {…};` the closure is
+ * at FILE level, so the primary ancestor walk correctly finds nothing and this
+ * fallback runs; an unrestricted version then grabs the preceding
+ * `function_definition` and mis-qualifies the file-level `$handler` as
+ * `target.$handler`. A preceding sibling is only an ENCLOSING callable when it
+ * cannot hold its own body — i.e. when the grammar split the body off.
+ *
+ * `SPLIT_SIGNATURE_NODE_TYPES` is exactly that set, and it is derived rather
+ * than listed: `LOCAL_SCOPE_BODY_NODE_TYPES` already filters the bare-signature
+ * types out of `FUNCTION_NODE_TYPES`, so the difference between them IS the
+ * split-signature set. PHP's `function_definition` carries a body and is in
+ * both, so it is excluded; Dart's `function_signature` is in only the former,
+ * so it qualifies.
+ *
+ * Language-neutral by construction — it names no grammar, and any future
+ * signature/body-split language is covered for free.
+ */
+export function findSplitBodyCallableAncestor(
+  node: SyntaxNode,
+  signatureOnlyTypes: ReadonlySet<string>,
+  boundaryTypes: ReadonlySet<string>,
+): SyntaxNode | null {
+  let current = node.parent;
+  while (current !== null) {
+    if (boundaryTypes.has(current.type)) return null;
+    const prev = current.previousNamedSibling;
+    if (
+      prev !== null &&
+      signatureOnlyTypes.has(prev.type) &&
+      // `current` must be the signature's BODY, not merely the next thing after
+      // it. Without this, valid TypeScript trips the fallback: in
+      //     declare namespace Api {
+      //       function internalHelper(x): number;
+      //       export function send(x): number;
+      //     }
+      // `send`'s `export_statement` is the next sibling of `internalHelper`'s
+      // `function_signature`, so `send` was mis-qualified as
+      // `internalHelper.send@r:c`. TypeScript emits bodyless
+      // function_signature/method_signature for overloads and ambient
+      // declarations, so the split-signature set is NOT Dart-only.
+      //
+      // A body contains statements; a declaration wrapper contains another
+      // signature. Rejecting any `current` that directly holds a signature of
+      // its own separates the two without naming a grammar.
+      !current.namedChildren.some((child) => signatureOnlyTypes.has(child.type))
+    ) {
+      return prev;
+    }
+    current = current.parent;
+  }
+  return null;
+}
+
+// SPLIT_SIGNATURE_NODE_TYPES is defined next to LOCAL_SCOPE_BODY_NODE_TYPES,
+// which it derives from — declaring it here would read it in its temporal dead
+// zone and throw at module load (tsc does NOT catch that; only running does).
+
+/**
  * Determine the graph node label from a tree-sitter capture map.
  * Handles language-specific reclassification via the provider's labelOverride hook
  * (e.g. C/C++ duplicate skipping, Kotlin Method promotion).
@@ -317,7 +593,19 @@ export function getLabelFromCaptures(
   const hasDefaultExportHocNameSeed =
     captureMap['definition.function'] !== undefined &&
     (captureMap['hoc'] !== undefined || captureMap['callee'] !== undefined);
-  if (!captureMap['name'] && !captureMap['definition.constructor'] && !hasDefaultExportHocNameSeed)
+  // Nameless `definition.class` / `definition.struct` pass through: a class
+  // extractor may synthesize the name (Java anonymous class bodies →
+  // `Worker$N`, #2550; a file-level type named after its file — the
+  // extractor receives the file path for exactly this). Downstream stays
+  // safe — parse-worker skips any nameless definition the extractor could
+  // not name (its `!nameNode && !extractedClassSymbol` gate).
+  if (
+    !captureMap['name'] &&
+    !captureMap['definition.constructor'] &&
+    !captureMap['definition.class'] &&
+    !captureMap['definition.struct'] &&
+    !hasDefaultExportHocNameSeed
+  )
     return null;
 
   if (captureMap['definition.function']) {
@@ -395,6 +683,223 @@ export interface EnclosingClassInfo {
  *    pathological hooks from creating an infinite loop. */
 const MAX_ENCLOSING_WALK_ITERATIONS = 4096;
 
+/**
+ * GitNexus's source-type-relative Java identity for local and anonymous
+ * types. It follows javac's `$N` allocation but intentionally omits the
+ * package prefix because graph ids already include the source file path.
+ */
+export interface JavaSynthesizedTypeIdentity {
+  readonly name: string;
+  readonly label: 'Class' | 'Enum' | 'Record' | 'Interface';
+  readonly bindingName?: string;
+}
+
+/** Named Java declarations that can host, or themselves be, local types. */
+const JAVA_NAMED_TYPE_NODE_LABELS = new Map<string, JavaSynthesizedTypeIdentity['label']>([
+  ['class_declaration', 'Class'],
+  ['enum_declaration', 'Enum'],
+  ['interface_declaration', 'Interface'],
+  ['record_declaration', 'Record'],
+]);
+
+const JAVA_ANON_HOST_TYPES = new Set(JAVA_NAMED_TYPE_NODE_LABELS.keys());
+const JAVA_LOCAL_TYPE_CONTAINERS = new Set([
+  'block',
+  'constructor_body',
+  'switch_block_statement_group',
+]);
+
+/** A legal local type declaration is a class, enum, record, or interface
+ * directly occupying a block-statement position. Annotation interfaces are
+ * deliberately excluded: javac rejects local annotation declarations. */
+export const javaLocalTypeDeclarationContainer = (node: SyntaxNode): SyntaxNode | null => {
+  if (!JAVA_NAMED_TYPE_NODE_LABELS.has(node.type)) return null;
+  const parent = node.parent;
+  return parent !== null && JAVA_LOCAL_TYPE_CONTAINERS.has(parent.type) ? parent : null;
+};
+
+const isJavaLocalTypeNode = (node: SyntaxNode): boolean =>
+  javaLocalTypeDeclarationContainer(node) !== null;
+
+/** The two Java anonymous-class-body shapes (#2550/#2555): an
+ *  `object_creation_expression` with a `class_body` child
+ *  (`new Runnable() { ... }`), and an `enum_constant` with a `body:`
+ *  field (`enum E { A { ... } }` — javac's other `E$N` shape). */
+const isJavaAnonymousBodyNode = (node: SyntaxNode): boolean =>
+  (node.type === 'object_creation_expression' &&
+    node.namedChildren?.some((c: SyntaxNode) => c.type === 'class_body') === true) ||
+  (node.type === 'enum_constant' && node.childForFieldName?.('body')?.type === 'class_body');
+
+/** Nearest ancestor of `node` that is an enclosing type per JLS 13.1. */
+const nearestJavaEnclosingType = (node: SyntaxNode): SyntaxNode | null => {
+  let cursor: SyntaxNode | null = node.parent;
+  let iterations = 0;
+  while (cursor) {
+    if (++iterations > MAX_ENCLOSING_WALK_ITERATIONS) return null;
+    if (JAVA_ANON_HOST_TYPES.has(cursor.type) || isJavaAnonymousBodyNode(cursor)) return cursor;
+    cursor = cursor.parent;
+  }
+  return null;
+};
+
+interface JavaTypeIdentityState {
+  readonly byStart: Map<number, JavaSynthesizedTypeIdentity>;
+  readonly ordinalByStart: Map<number, number>;
+}
+
+/** Parse-tree-bounded memo. Sequence ordinals are built once per tree, avoiding
+ * a host-candidate scan for every extraction/ownership consumer. */
+const javaTypeIdentityMemo = new WeakMap<object, JavaTypeIdentityState>();
+
+const javaHostKey = (node: SyntaxNode): string => `${node.type}:${node.startIndex}`;
+
+const javaIdentityCandidatesBelow = (root: SyntaxNode): SyntaxNode[] => {
+  const seen = new Set<string>();
+  const candidates: SyntaxNode[] = [];
+  for (const type of [
+    'object_creation_expression',
+    'enum_constant',
+    ...JAVA_NAMED_TYPE_NODE_LABELS.keys(),
+  ]) {
+    for (const candidate of root.descendantsOfType?.(type) ?? []) {
+      if (!isJavaAnonymousBodyNode(candidate) && !isJavaLocalTypeNode(candidate)) continue;
+      const key = javaHostKey(candidate);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      candidates.push(candidate);
+    }
+  }
+  return candidates.sort((left, right) => left.startIndex - right.startIndex);
+};
+
+const buildJavaTypeIdentityState = (root: SyntaxNode): JavaTypeIdentityState => {
+  const ordinalByStart = new Map<number, number>();
+  const sequenceCounts = new Map<string, number>();
+  for (const candidate of javaIdentityCandidatesBelow(root)) {
+    const host = nearestJavaEnclosingType(candidate);
+    if (host === null) continue;
+    const isAnonymous = isJavaAnonymousBodyNode(candidate);
+    const bindingName = isAnonymous ? '' : candidate.childForFieldName?.('name')?.text;
+    // Anonymous types deliberately use the empty sequence key; malformed named
+    // declarations must not enter that sequence.
+    if (!isAnonymous && !bindingName) continue;
+    const sequenceKey = `${javaHostKey(host)}:${bindingName}`;
+    const ordinal = (sequenceCounts.get(sequenceKey) ?? 0) + 1;
+    sequenceCounts.set(sequenceKey, ordinal);
+    ordinalByStart.set(candidate.startIndex, ordinal);
+  }
+  return { byStart: new Map(), ordinalByStart };
+};
+
+const javaTypeIdentityStateFor = (node: SyntaxNode): JavaTypeIdentityState => {
+  const tree = (node as { tree?: { rootNode?: SyntaxNode } }).tree;
+  if (tree === undefined) {
+    const host = nearestJavaEnclosingType(node);
+    return buildJavaTypeIdentityState(host ?? node);
+  }
+  let state = javaTypeIdentityMemo.get(tree);
+  if (state === undefined) {
+    state = buildJavaTypeIdentityState(tree.rootNode ?? node);
+    javaTypeIdentityMemo.set(tree, state);
+  }
+  return state;
+};
+
+/** Source-type-relative binary name of a Java enclosing type, including
+ * synthesized local/anonymous hosts and named member-type chains. */
+const javaBinaryNameOfType = (node: SyntaxNode): string | undefined => {
+  if (isJavaAnonymousBodyNode(node) || isJavaLocalTypeNode(node)) {
+    return synthesizeJavaTypeIdentity(node)?.name;
+  }
+  if (!JAVA_ANON_HOST_TYPES.has(node.type)) return undefined;
+  const simpleName = node.childForFieldName?.('name')?.text;
+  if (simpleName === undefined || simpleName.length === 0) return undefined;
+  const enclosing = nearestJavaEnclosingType(node);
+  if (enclosing === null) return simpleName;
+  const enclosingName = javaBinaryNameOfType(enclosing);
+  return enclosingName === undefined ? undefined : `${enclosingName}$${simpleName}`;
+};
+
+/**
+ * For a container node that is the direct `return` value of a function whose
+ * declared return type is the literal `type` (`fn List(comptime T: type) type
+ * { return struct {…}; }`), the function's `name` node; undefined otherwise.
+ * Language-agnostic by shape — today only tree-sitter-zig produces it.
+ */
+function typeConstructorNameNode(container: SyntaxNode): SyntaxNode | undefined {
+  const ret = container.parent;
+  if (ret?.type !== 'return_expression') return undefined;
+  const stmt = ret.parent;
+  if (stmt?.type !== 'expression_statement') return undefined;
+  const block = stmt.parent;
+  if (block?.type !== 'block') return undefined;
+  const fn = block.parent;
+  if (fn?.type !== 'function_declaration') return undefined;
+  if (fn.childForFieldName?.('body')?.id !== block.id) return undefined;
+  if (fn.childForFieldName?.('type')?.text !== 'type') return undefined;
+  return fn.childForFieldName?.('name') ?? undefined;
+}
+
+/**
+ * Authoritative Java local/anonymous type identity.
+ *
+ * JLS 13.1 defines the shape and immediate-host prefix. OpenJDK javac's
+ * Check.localClassName allocates N independently for each
+ * (enclosing binary name, local simple name) pair; anonymous types use the
+ * empty simple name and therefore have their own sequence. Package names are
+ * omitted from this project identity because graph ids already include the
+ * file path.
+ */
+export const synthesizeJavaTypeIdentity = (
+  node: SyntaxNode,
+): JavaSynthesizedTypeIdentity | undefined => {
+  const localLabel = JAVA_NAMED_TYPE_NODE_LABELS.get(node.type);
+  const isLocal = localLabel !== undefined && isJavaLocalTypeNode(node);
+  const isAnonymous = isJavaAnonymousBodyNode(node);
+  const enclosing = nearestJavaEnclosingType(node);
+  const memberSimpleName =
+    !isLocal && !isAnonymous && localLabel !== undefined
+      ? node.childForFieldName?.('name')?.text
+      : undefined;
+  const synthesizedHostIdentity =
+    memberSimpleName !== undefined && enclosing !== null
+      ? synthesizeJavaTypeIdentity(enclosing)
+      : undefined;
+  if (!isLocal && !isAnonymous && synthesizedHostIdentity === undefined) return undefined;
+  if (enclosing === null) return undefined;
+
+  const state = javaTypeIdentityStateFor(node);
+  const cached = state.byStart.get(node.startIndex);
+  if (cached !== undefined) return cached;
+
+  const prefix = javaBinaryNameOfType(enclosing);
+  if (prefix === undefined) return undefined;
+
+  if (memberSimpleName !== undefined) {
+    const identity: JavaSynthesizedTypeIdentity = {
+      name: `${prefix}$${memberSimpleName}`,
+      label: localLabel!,
+      bindingName: memberSimpleName,
+    };
+    state.byStart.set(node.startIndex, identity);
+    return identity;
+  }
+
+  const bindingName = isLocal ? node.childForFieldName?.('name')?.text : undefined;
+  if (isLocal && !bindingName) return undefined;
+
+  const ordinal = state.ordinalByStart.get(node.startIndex);
+  if (ordinal === undefined) return undefined;
+
+  const identity: JavaSynthesizedTypeIdentity = {
+    name: `${prefix}$${ordinal}${bindingName ?? ''}`,
+    label: isAnonymous ? 'Class' : localLabel!,
+    ...(bindingName === undefined ? {} : { bindingName }),
+  };
+  state.byStart.set(node.startIndex, identity);
+  return identity;
+};
+
 export const findEnclosingClassInfo = (
   node: SyntaxNode,
   filePath: string,
@@ -409,6 +914,29 @@ export const findEnclosingClassInfo = (
    * the node-id is built from, guaranteeing owner-id == node-id by construction.
    */
   getQualifiedOwnerName?: (node: SyntaxNode, simpleName: string) => string | null,
+  /**
+   * Optional: the type the whole FILE declares (`LanguageProvider.resolveFileTypeOwner`).
+   * Consulted only when the walk reaches the tree root without meeting a
+   * container, so a member declared at file level can be owned by the file's
+   * own type (Zig file-structs). The name is what the definition phase names
+   * the class-like node, so owner id == node id by construction.
+   */
+  resolveFileTypeOwner?: (
+    root: SyntaxNode,
+    filePath: string,
+  ) => { readonly name: string; readonly label: NodeLabel } | null,
+  /**
+   * Optional: the type a CONTAINER node declares
+   * (`LanguageProvider.resolveContainerTypeOwner`). Consulted for every
+   * `CLASS_CONTAINER_TYPES` node the walk meets, before the generic name-child
+   * derivation, for languages whose containers are named from context (a
+   * binding wrapper, an enclosing callable, an anonymous ordinal). Null falls
+   * through to the generic derivation.
+   */
+  resolveContainerTypeOwner?: (
+    container: SyntaxNode,
+    filePath: string,
+  ) => { readonly name: string; readonly label: NodeLabel } | null,
 ): EnclosingClassInfo | null => {
   let current = node.parent;
   let iterations = 0;
@@ -442,21 +970,44 @@ export const findEnclosingClassInfo = (
         }
       }
     }
-    // Go: type_declaration wrapping a struct_type (type User struct { ... })
-    if (current.type === 'type_declaration') {
-      const typeSpec = current.children?.find((c: SyntaxNode) => c.type === 'type_spec');
-      if (typeSpec) {
-        const typeBody = typeSpec.childForFieldName?.('type');
-        if (typeBody?.type === 'struct_type' || typeBody?.type === 'interface_type') {
-          const nameNode = typeSpec.childForFieldName?.('name');
-          if (nameNode) {
-            const label = typeBody.type === 'struct_type' ? 'Struct' : 'Interface';
-            return {
-              classId: generateId(label, `${filePath}:${nameNode.text}`),
-              className: nameNode.text,
-            };
-          }
+    // Go: the `type_spec` IS the declared type (`type User struct { ... }`, and
+    // one per member of a grouped `type ( A struct{…}; B struct{…} )` block).
+    //
+    // Matched here rather than on the enclosing `type_declaration` (#2837): this
+    // walk climbs `node.parent`, so it passes THROUGH the containing spec on its
+    // way up from any member, and the structure it already has is the answer.
+    // Keying on the wrapper instead meant picking one spec out of several with
+    // no reference point — which filed every member of a grouped block under its
+    // FIRST struct, so two same-named fields minted one id and first-write-wins
+    // dropped the second.
+    if (current.type === 'type_spec') {
+      const typeBody = current.childForFieldName?.('type');
+      if (typeBody?.type === 'struct_type' || typeBody?.type === 'interface_type') {
+        const nameNode = current.childForFieldName?.('name');
+        if (nameNode) {
+          const label = typeBody.type === 'struct_type' ? 'Struct' : 'Interface';
+          return {
+            classId: generateId(label, `${filePath}:${nameNode.text}`),
+            className: nameNode.text,
+          };
         }
+      }
+    }
+    // Java: an anonymous class body owns its members — attribute to the
+    // synthesized `Worker$N`/`E$N` class, not the lexically enclosing
+    // named type (#2550/#2555). Covers both shapes: `new Runnable() { ... }`
+    // and enum constant bodies (`enum E { A { ... } }`). The synthesis
+    // returns undefined for shape-less nodes (plain `new Foo()`, a body-less
+    // enum constant, and every C# `object_creation_expression`), so the
+    // walk continues unchanged for those — including on to
+    // `enum_declaration`, which sits in CLASS_CONTAINER_TYPES below.
+    if (isJavaAnonymousBodyNode(current) || JAVA_ANON_HOST_TYPES.has(current.type)) {
+      const identity = synthesizeJavaTypeIdentity(current);
+      if (identity !== undefined) {
+        return {
+          classId: generateId(identity.label, `${filePath}:${identity.name}`),
+          className: identity.name,
+        };
       }
     }
     if (CLASS_CONTAINER_TYPES.has(current.type)) {
@@ -480,6 +1031,19 @@ export const findEnclosingClassInfo = (
           // Provider remapped to a different node — re-evaluate from there.
           current = resolved;
           continue;
+        }
+      }
+
+      // A container the PROVIDER names from context (binding wrapper,
+      // enclosing callable, anonymous ordinal — Zig). The name is what the
+      // class-like node is minted under, so owner id == node id.
+      if (resolveContainerTypeOwner !== undefined) {
+        const containerOwner = resolveContainerTypeOwner(current, filePath);
+        if (containerOwner !== null) {
+          return {
+            classId: generateId(containerOwner.label, `${filePath}:${containerOwner.name}`),
+            className: containerOwner.name,
+          };
         }
       }
 
@@ -571,7 +1135,27 @@ export const findEnclosingClassInfo = (
             c.type === 'identifier' ||
             c.type === 'name' ||
             c.type === 'constant',
-        );
+        ) ??
+        // An ANONYMOUS container bound by the enclosing declaration —
+        // `const Point = struct { … }` (tree-sitter-zig: struct/enum/union/
+        // opaque nodes carry no name; the binding identifier is the first
+        // named child of the parent `variable_declaration`). Same shape as the
+        // Go `type_spec` branch above: the name lives one level up. Without it
+        // the walk climbed past every Zig container and no member ever got a
+        // HAS_METHOD / HAS_PROPERTY owner. The definition phase names the
+        // container node from the same binding (`@name` on the wrapper), so
+        // the owner id and the node id agree by construction.
+        (current.parent?.type === 'variable_declaration'
+          ? current.parent.namedChildren?.find((c: SyntaxNode) => c.type === 'identifier')
+          : undefined) ??
+        // An anonymous container RETURNED by a type-constructor function —
+        // `pub fn List(comptime T: type) type { return struct { … }; }`
+        // (Zig's only spelling of a generic type). The container's name is
+        // the function's, which is what the definition phase uses too
+        // (`@name` on the fn identifier, anchor on the container), so the
+        // owner id and the node id agree by construction. Only the literal
+        // `return <container>` of a fn returning `type` qualifies.
+        typeConstructorNameNode(current);
       if (nameNode) {
         let label = CONTAINER_TYPE_TO_LABEL[current.type] || 'Class';
         // Kotlin: class_declaration with an anonymous "interface" keyword child
@@ -628,6 +1212,17 @@ export const findEnclosingClassInfo = (
         };
       }
     }
+    if (current.parent === null && resolveFileTypeOwner !== undefined) {
+      // Tree root reached with no container on the way: ask the provider
+      // whether the file itself is the owner.
+      const fileOwner = resolveFileTypeOwner(current, filePath);
+      if (fileOwner !== null) {
+        return {
+          classId: generateId(fileOwner.label, `${filePath}:${fileOwner.name}`),
+          className: fileOwner.name,
+        };
+      }
+    }
     current = current.parent;
   }
   return null;
@@ -636,7 +1231,51 @@ export const findEnclosingClassInfo = (
 /** Object literal binding info for TS/JS shorthand methods. */
 export interface ObjectLiteralBindingInfo {
   ownerId: string;
+  /**
+   * Owner name, when the owner is also the member's qualifier.
+   *
+   * Set by {@link findMemberAssignmentOwnerInfo} so a prototype method keys as
+   * `Foo.bar` — without it two constructors in one file that each define
+   * `bar` collapse onto a single `Method:<file>:bar` id.
+   *
+   * {@link findObjectLiteralBindingInfo} sets it ONLY when the caller opts in
+   * via `includeOwnerName`. Its `Method` ids must stay exactly as they were —
+   * qualifying them would rewrite every object-literal method id in every
+   * indexed repo — but object-literal KEYS (indexed since A1/A5) genuinely
+   * need it: two config objects in one file sharing a key name otherwise
+   * collapse onto a single `Property:<file>:<key>` id, merging two distinct
+   * settings into one symbol.
+   */
+  ownerName?: string;
 }
+
+/**
+ * True when an object-literal member is contained by an array before reaching
+ * another callable or class boundary.
+ *
+ * An array does not provide a stable named owner for its elements, so members
+ * below one cannot use `<binding>.<member>` identity or ownership. They still
+ * need distinct graph identities, however; callers use this predicate to opt
+ * into source-position qualification while keeping ownership suppressed.
+ */
+export const isArrayContainedObjectLiteralMember = (node: SyntaxNode): boolean => {
+  let current: SyntaxNode | null = node;
+  let sawObject = false;
+
+  while (current) {
+    if (current.type === 'object') sawObject = true;
+    if (current.type === 'array' && sawObject) return true;
+    if (
+      current !== node &&
+      (FUNCTION_NODE_TYPES.has(current.type) || CLASS_CONTAINER_TYPES.has(current.type))
+    ) {
+      return false;
+    }
+    current = current.parent;
+  }
+
+  return false;
+};
 
 /**
  * Block-statement AST types that disqualify an object-literal binding from
@@ -687,9 +1326,101 @@ const BLOCK_SCOPE_BOUNDARY_TYPES = new Set([
  *     ancestor also returns null (catches block-scoped declarations inside
  *     top-level `if`/`for`/`try`/etc., which cannot be imported).
  */
+/**
+ * Owner for the keys of an ANONYMOUS object literal in return position (R3-4).
+ *
+ * `return { symbol, score, wickRatio, … }` binds to nothing, so its keys had no
+ * anchor and could not be qualified — which on the reporting repo left the
+ * central payload of the signal pipeline, ~25 fields, entirely unqueryable.
+ * There are 437 such sites in one backend directory, so this is the dominant
+ * shape, not an edge case.
+ *
+ * The enclosing FUNCTION is the honest owner: the literal is that function's
+ * return shape, which is a contract its callers consume. Qualifying by it keeps
+ * two functions returning the same key name as two distinct nodes, exactly as
+ * `ownerName` does for variable-bound literals.
+ *
+ * Returns null when the literal is not DIRECTLY returned (a nested literal, or
+ * one inside a callback several frames down), because then the enclosing
+ * function is not what the object describes.
+ */
+/**
+ * True when this definition node is a key of a literal in RETURN position.
+ *
+ * Deliberately independent of whether an OWNER NAME could be derived. The two
+ * are different questions, and conflating them mislabels the anonymous case:
+ * `[function (row) { return { k: row.x }; }]` yields no name to qualify by, so
+ * the owner lookup returns null — but the key is still a return shape, and
+ * flagging it by owner-presence would leave it looking like a DECLARED anchor
+ * and let it outrank a real declaration during narrowing.
+ */
+export const isReturnShapeProperty = (node: SyntaxNode): boolean => {
+  let current: SyntaxNode | null = node;
+  let objectDepth = 0;
+  while (current && objectDepth === 0) {
+    if (current.type === 'object') objectDepth = 1;
+    else if (FUNCTION_NODE_TYPES.has(current.type)) return false;
+    else current = current.parent;
+  }
+  return current?.parent?.type === 'return_statement';
+};
+
+export const findReturnShapeOwnerInfo = (
+  node: SyntaxNode,
+  filePath: string,
+  // NO `ownerId`, deliberately, and the union's optional field is what says so.
+  // An owner id would emit `HAS_PROPERTY` from the FUNCTION, a `Function|Property`
+  // relation pair that the schema does not declare — and an undeclared pair does
+  // not degrade, it throws `UndeclaredRelationPairError` and kills the entire
+  // analyze. That already shipped once in this PR. The qualifier alone is what
+  // this needs: it makes the key nameable and keeps two functions' same-named
+  // keys distinct, without asserting a containment edge nothing consumes.
+): { readonly ownerId?: string; readonly ownerName: string } | null => {
+  // Walk to the literal this key belongs to; bail if it is nested inside
+  // another object, whose shape it describes instead.
+  let current: SyntaxNode | null = node;
+  let objectDepth = 0;
+  while (current && objectDepth === 0) {
+    if (current.type === 'object') objectDepth = 1;
+    else if (FUNCTION_NODE_TYPES.has(current.type)) return null;
+    else current = current.parent;
+  }
+  if (!current) return null;
+  const literal = current;
+  if (literal.parent?.type !== 'return_statement') return null;
+
+  // The nearest enclosing function-like, and its name. An anonymous function
+  // (a callback, an IIFE) gives nothing to qualify by, so those stay
+  // unanchored rather than colliding on a shared empty owner.
+  let fn: SyntaxNode | null = literal.parent.parent;
+  while (fn && !FUNCTION_NODE_TYPES.has(fn.type)) fn = fn.parent;
+  if (!fn) return null;
+
+  const nameNode = fn.childForFieldName?.('name');
+  if (nameNode?.type === 'identifier' || nameNode?.type === 'property_identifier') {
+    return { ownerName: nameNode.text };
+  }
+  // `const formatAlert = (…) => ({ … })` and `const f = function () {}`: the
+  // name is on the declarator, not the function.
+  const declarator = fn.parent;
+  if (declarator?.type === 'variable_declarator') {
+    const declName = declarator.childForFieldName?.('name');
+    if (declName?.type === 'identifier') return { ownerName: declName.text };
+  }
+  void filePath;
+  return null;
+};
+
 export const findObjectLiteralBindingInfo = (
   node: SyntaxNode,
   filePath: string,
+  options?: {
+    /**
+     * Also return `ownerName` so the member qualifies as `<owner>.<member>`.
+     * Opt-in because turning it on for `Method` would rewrite existing ids.
+     */
+    readonly includeOwnerName?: boolean;
+  },
 ): ObjectLiteralBindingInfo | null => {
   // ── Phase A: walk up from node, count `object` ancestors, find declarator
   let current: SyntaxNode | null = node;
@@ -699,6 +1430,13 @@ export const findObjectLiteralBindingInfo = (
   while (current) {
     if (current.type === 'object') {
       objectDepth += 1;
+    }
+
+    if (current !== node && current.type === 'array') {
+      // `const handlers = [{ run() {} }]` has no `handlers.run` member.
+      // Crossing the array would mint a confident but false owner edge; keep
+      // the existing conservative under-approximation used for nested objects.
+      return null;
     }
 
     if (current.type === 'variable_declarator' && objectDepth >= 1) {
@@ -747,8 +1485,204 @@ export const findObjectLiteralBindingInfo = (
   const ownerLabel = declaration?.type === 'variable_declaration' ? 'Variable' : 'Const';
   return {
     ownerId: generateId(ownerLabel, `${filePath}:${nameNode.text}`),
+    ...(options?.includeOwnerName === true ? { ownerName: nameNode.text } : {}),
   };
 };
+
+/**
+ * Find the owner of a member assigned by `<Owner>.prototype.<member> = fn`
+ * (#2723 follow-up).
+ *
+ * Sibling of {@link findObjectLiteralBindingInfo}: same seam, same return
+ * shape, different syntax. There the owner is the variable the literal is
+ * bound to; here it is the identifier to the left of `.prototype`.
+ *
+ * The owner label is read from the file's own module-scope declaration, so the
+ * edge points at the node that actually exists — `function Foo() {}` is a
+ * `Function` node, `class Foo {}` is a `Class` node. When the file declares no
+ * such name (the constructor lives in another module) no owner is claimed:
+ * a HAS_METHOD edge to a fabricated node is worse than a top-level Method.
+ */
+export const findMemberAssignmentOwnerInfo = (
+  node: SyntaxNode,
+  filePath: string,
+): ObjectLiteralBindingInfo | null => {
+  const ownerName = prototypeAssignmentOwnerName(node) ?? thisAssignmentOwnerName(node);
+  if (ownerName === null) return null;
+
+  const root = (node as { tree?: { rootNode?: SyntaxNode } }).tree?.rootNode;
+  if (!root) return null;
+
+  const ownerLabel = prototypeOwnerLabel(root, ownerName);
+  if (ownerLabel === null) return null;
+
+  return { ownerId: generateId(ownerLabel, `${filePath}:${ownerName}`), ownerName };
+};
+
+/** Right-hand-side node types that make an assignment a callable binding. */
+const CALLABLE_ASSIGNMENT_VALUE_TYPES: ReadonlySet<string> = new Set([
+  'arrow_function',
+  'function_expression',
+  'generator_function',
+]);
+
+/**
+ * The receiver name of a `<Owner>.prototype.<member> = <function>` assignment,
+ * or null when `assignment` is not that shape.
+ *
+ * Only a bare identifier owner is accepted. `a.b.prototype.c = …` and
+ * `getClass().prototype.c = …` name an owner this layer cannot resolve to a
+ * definition, so they are left alone rather than attributed to a guess.
+ */
+export const prototypeAssignmentOwnerName = (assignment: SyntaxNode): string | null => {
+  const left = callableAssignmentTarget(assignment);
+  if (left === null) return null;
+
+  const protoRef = left.childForFieldName('object');
+  if (protoRef === null || protoRef.type !== 'member_expression') return null;
+
+  if (protoRef.childForFieldName('property')?.text !== 'prototype') return null;
+
+  const owner = protoRef.childForFieldName('object');
+  if (owner === null || owner.type !== 'identifier') return null;
+
+  return owner.text;
+};
+
+/** The `member_expression` being assigned a function value, or null. */
+const callableAssignmentTarget = (assignment: SyntaxNode): SyntaxNode | null => {
+  if (assignment.type !== 'assignment_expression') return null;
+
+  const right = assignment.childForFieldName('right');
+  if (right === null || !CALLABLE_ASSIGNMENT_VALUE_TYPES.has(right.type)) return null;
+
+  const left = assignment.childForFieldName('left');
+  return left !== null && left.type === 'member_expression' ? left : null;
+};
+
+/**
+ * The constructor function that owns a `this.member = <function>` assignment,
+ * or null when there is none (module top level, or an owner this layer cannot
+ * name).
+ *
+ * Only a `function_declaration` counts. An `arrow_function` does NOT bind its
+ * own `this` (ECMA-262 gives it `[[ThisMode]] = lexical`), so the walk passes
+ * through arrows to the function that actually binds the receiver — the same
+ * rule `@receiver-owner.this` encodes in the scope queries (#2701). A class
+ * method never reaches here: parse-worker resolves its owner from the
+ * enclosing class container first.
+ */
+export const thisAssignmentOwnerName = (assignment: SyntaxNode): string | null => {
+  const left = callableAssignmentTarget(assignment);
+  if (left === null) return null;
+  if (left.childForFieldName('object')?.type !== 'this') return null;
+
+  for (let anc: SyntaxNode | null = assignment.parent; anc !== null; anc = anc.parent) {
+    if (anc.type === 'arrow_function') continue;
+    if (anc.type === 'function_declaration') {
+      const name = anc.childForFieldName('name');
+      return name !== null && name.type === 'identifier' ? name.text : null;
+    }
+    // Any other receiver-binding form (function_expression, method_definition,
+    // generator) owns the `this` but gives this layer no module-scope name to
+    // point an owner edge at.
+    if (FUNCTION_NODE_TYPES.has(anc.type) || CLASS_CONTAINER_TYPES.has(anc.type)) return null;
+  }
+  return null;
+};
+
+/**
+ * True when `node` is a `X.prototype.Y = <function>` or `this.Y = <function>`
+ * assignment — i.e. a callable MEMBER rather than a free function.
+ *
+ * Takes the ASSIGNMENT node, because that is what the `@definition.function`
+ * capture is anchored on and therefore what `provider.labelOverride` receives.
+ */
+export const isPrototypeMemberAssignmentNode = (node: SyntaxNode): boolean =>
+  prototypeAssignmentOwnerName(node) !== null || isThisMemberAssignmentNode(node);
+
+/**
+ * True when `node` is `module.exports = <anonymous function>` (#2723).
+ *
+ * The whole module IS the callable, so there is no property to take a name
+ * from and the caller supplies a file-derived one. A NAMED function expression
+ * is excluded — its own name is captured directly and is more informative.
+ */
+
+/**
+ * True when `node` is `module.exports = <function>`, named or anonymous — the
+ * CommonJS default export, where the whole module IS the callable.
+ *
+ * `exports = fn` is deliberately NOT this shape: reassigning the `exports`
+ * binding does not export anything in CommonJS, it only breaks the alias to
+ * `module.exports`.
+ */
+export const isCjsDefaultExportAssignment = (node: SyntaxNode): boolean => {
+  if (node.type !== 'assignment_expression') return false;
+
+  const right = node.childForFieldName('right');
+  if (right === null || !CALLABLE_ASSIGNMENT_VALUE_TYPES.has(right.type)) return false;
+
+  const left = node.childForFieldName('left');
+  if (left === null || left.type !== 'member_expression') return false;
+
+  return (
+    left.childForFieldName('object')?.text === 'module' &&
+    left.childForFieldName('property')?.text === 'exports'
+  );
+};
+
+/** True when `node` is a `this.Y = <function>` assignment, at any nesting. */
+export const isThisMemberAssignmentNode = (node: SyntaxNode): boolean => {
+  const left = callableAssignmentTarget(node);
+  return left !== null && left.childForFieldName('object')?.type === 'this';
+};
+
+/**
+ * The label the owner named by {@link prototypeAssignmentOwnerName} carries in
+ * the graph, so the owner edge points at the node that actually exists.
+ * Returns null when the file declares no such module-scope name.
+ */
+const prototypeOwnerLabel = (root: SyntaxNode, ownerName: string): 'Class' | 'Function' | null => {
+  for (const child of root.namedChildren) {
+    const decl = child.type === 'export_statement' ? child.childForFieldName('declaration') : child;
+    if (decl === null) continue;
+
+    if (decl.childForFieldName('name')?.text === ownerName) {
+      if (decl.type === 'class_declaration') return 'Class';
+      if (decl.type === 'function_declaration' || decl.type === 'generator_function_declaration')
+        return 'Function';
+    }
+
+    // `var Foo = function () {}` / `const Foo = () => {}` / `const Foo = class {}`.
+    // The dominant pre-ES6 constructor form, and the population this whole
+    // change targets. Without it `prototypeOwnerLabel` returned null, the
+    // member fell back to an UNQUALIFIED `Method:<file>:<member>` id, and two
+    // constructors defining the same member name in one file collapsed onto a
+    // single node with no owner edges at all (#2729 review F6).
+    if (!VARIABLE_DECLARATION_NODE_TYPES.has(decl.type)) continue;
+    for (const declarator of decl.namedChildren) {
+      if (declarator.type !== 'variable_declarator') continue;
+      if (declarator.childForFieldName('name')?.text !== ownerName) continue;
+      const value = declarator.childForFieldName('value');
+      if (value === null) continue;
+      // Only a callable value is claimed. A closure binding reliably emits
+      // `Function:<file>:<name>` (the #2687/#2693 convention), so the owner id
+      // resolves to a node that exists. A class EXPRESSION or a require()-bound
+      // value names an owner whose node label this layer cannot predict —
+      // claim none rather than point an edge at a node that may not exist,
+      // which is the same defect class this fix exists to remove.
+      if (CALLABLE_ASSIGNMENT_VALUE_TYPES.has(value.type)) return 'Function';
+    }
+  }
+  return null;
+};
+
+/** Declaration nodes carrying `variable_declarator` children (JS/TS). */
+const VARIABLE_DECLARATION_NODE_TYPES: ReadonlySet<string> = new Set([
+  'lexical_declaration',
+  'variable_declaration',
+]);
 
 /** Convenience wrapper: returns just the class ID string (backward compat). */
 export const findEnclosingClassId = (node: SyntaxNode, filePath: string): string | null => {
@@ -889,6 +1823,22 @@ export const LOCAL_SCOPE_BODY_NODE_TYPES: ReadonlySet<string> = new Set(
     ]),
 );
 
+/**
+ * Callable node types whose grammar splits the body off into a SIBLING node, so
+ * the callable is never an ancestor of the code inside it (Dart
+ * `function_signature` / `method_signature`).
+ *
+ * Derived, not listed, so it cannot drift from the two sets that define it:
+ * `LOCAL_SCOPE_BODY_NODE_TYPES` is `FUNCTION_NODE_TYPES` minus exactly the bare
+ * signature types, so the difference IS the split-signature set.
+ *
+ * Must stay BELOW `LOCAL_SCOPE_BODY_NODE_TYPES` — reading it earlier hits the
+ * temporal dead zone and throws at module load.
+ */
+export const SPLIT_SIGNATURE_NODE_TYPES: ReadonlySet<string> = new Set(
+  [...FUNCTION_NODE_TYPES].filter((t) => !LOCAL_SCOPE_BODY_NODE_TYPES.has(t)),
+);
+
 // ============================================================================
 // Generic AST traversal helpers (shared by parse-worker + php-helpers)
 // ============================================================================
@@ -926,12 +1876,11 @@ export function findChild(node: SyntaxNode, type: string): SyntaxNode | null {
   return null;
 }
 
-/** Remove bidi-override and zero-width control characters. Doc text is
- *  attacker-influenced (any indexed repo) and is returned verbatim to MCP
- *  clients, so strip Trojan-Source-style hidden controls from the description
- *  before it leaves the extractor (#2286 review). Scoped to the doc-comment path
- *  only — global `sanitizeUTF8` is intentionally untouched. */
-const stripBidiAndZeroWidth = (text: string): string =>
+/** Remove bidi-override and zero-width control characters from attacker-
+ *  influenced repository text before it is exposed through graph descriptions
+ *  or MCP output (#2286). Global `sanitizeUTF8` intentionally remains focused
+ *  on encoding/control-character validity. */
+export const stripBidiAndZeroWidth = (text: string): string =>
   Array.from(text)
     .filter((ch) => {
       const c = ch.codePointAt(0) ?? 0;

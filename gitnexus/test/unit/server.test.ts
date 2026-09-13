@@ -23,6 +23,7 @@ import {
   SHUTDOWN_EXIT_CODES,
 } from '../../src/mcp/server.js';
 import { GITNEXUS_TOOLS } from '../../src/mcp/tools.js';
+import { createMcpRepositoryPolicy } from '../../src/mcp/repository-policy.js';
 
 // ─── Mock backend ──────────────────────────────────────────────────
 
@@ -30,7 +31,12 @@ function createMockBackend(overrides: Record<string, any> = {}): any {
   return {
     callTool: vi.fn().mockResolvedValue({ result: 'ok' }),
     listRepos: vi.fn().mockResolvedValue([]),
+    countRepos: vi.fn().mockResolvedValue(0),
+    cachedRepoCount: vi.fn().mockReturnValue(0),
     resolveRepo: vi
+      .fn()
+      .mockResolvedValue({ name: 'test', repoPath: '/tmp/test', lastCommit: 'abc' }),
+    selectToolRepository: vi
       .fn()
       .mockResolvedValue({ name: 'test', repoPath: '/tmp/test', lastCommit: 'abc' }),
     getContext: vi.fn().mockReturnValue(null),
@@ -41,6 +47,27 @@ function createMockBackend(overrides: Record<string, any> = {}): any {
     disconnect: vi.fn().mockResolvedValue(undefined),
     ...overrides,
   };
+}
+
+async function callToolThroughServer(
+  backend: ReturnType<typeof createMockBackend>,
+  name: string,
+  args: Record<string, unknown>,
+): Promise<{ text: string; isError: boolean }> {
+  const server = createMCPServer(backend);
+  const client = new Client({ name: 'budget-test-client', version: '0.0.0' });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+
+  try {
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    const response = await client.callTool({ name, arguments: args });
+    const text = response.content.find((item) => item.type === 'text')?.text;
+    if (typeof text !== 'string') throw new Error('Expected an MCP text response');
+    return { text, isError: response.isError === true };
+  } finally {
+    await client.close();
+    await server.close();
+  }
 }
 
 // ─── createMCPServer ─────────────────────────────────────────────────
@@ -83,6 +110,128 @@ describe('createMCPServer', () => {
       await server.close();
     }
   });
+  it('requires repo in repo-scoped tool schemas when cwd cannot resolve multiple repos', async () => {
+    const backend = createMockBackend({
+      countRepos: vi.fn().mockResolvedValue(2),
+      listRepos: vi.fn().mockResolvedValue([
+        { name: 'alpha', path: '/tmp/alpha' },
+        { name: 'beta', path: '/tmp/beta' },
+      ]),
+      selectToolRepository: vi.fn().mockRejectedValue(new Error('Multiple repositories indexed')),
+    });
+    const server = createMCPServer(backend);
+    const client = new Client({ name: 'multi-repo-client', version: '0.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+
+    try {
+      await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+      const tools = await client.listTools();
+      const query = tools.tools.find((tool) => tool.name === 'query');
+      const listRepos = tools.tools.find((tool) => tool.name === 'list_repos');
+
+      expect(query?.inputSchema.required).toContain('repo');
+      expect(listRepos?.inputSchema.required).not.toContain('repo');
+      expect(
+        GITNEXUS_TOOLS.find((tool) => tool.name === 'query')?.inputSchema.required,
+      ).not.toContain('repo');
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it('keeps repo optional when cwd resolves one of multiple visible repos', async () => {
+    const backend = createMockBackend({
+      countRepos: vi.fn().mockResolvedValue(2),
+      cachedRepoCount: vi.fn().mockReturnValue(2),
+      listRepos: vi.fn().mockResolvedValue([
+        { name: 'alpha', path: '/tmp/alpha' },
+        { name: 'beta', path: '/tmp/beta' },
+      ]),
+      selectToolRepository: vi
+        .fn()
+        .mockResolvedValue({ name: 'alpha', repoPath: '/tmp/alpha', lastCommit: 'abc' }),
+    });
+    const server = createMCPServer(backend);
+    const client = new Client({ name: 'cwd-repo-client', version: '0.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+
+    try {
+      await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+      const tools = await client.listTools();
+      const context = tools.tools.find((tool) => tool.name === 'context');
+      const rename = tools.tools.find((tool) => tool.name === 'rename');
+
+      expect(context?.inputSchema.required).not.toContain('repo');
+      expect(rename?.inputSchema.required).toContain('repo');
+      const response = await client.callTool({ name: 'context', arguments: { name: 'Example' } });
+      expect(response.isError).not.toBe(true);
+      expect(backend.callTool).toHaveBeenCalledWith('context', { name: 'Example' });
+      expect(backend.countRepos).toHaveBeenCalledTimes(1);
+      expect(backend.listRepos).not.toHaveBeenCalled();
+      expect(backend.selectToolRepository).toHaveBeenCalledTimes(1);
+      expect(backend.selectToolRepository).toHaveBeenCalledWith(undefined, undefined, {
+        allowCwdDefault: true,
+        refreshRegistry: true,
+      });
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it('keeps repo optional when a default repo is configured', async () => {
+    const backend = createMockBackend({
+      listRepos: vi.fn().mockResolvedValue([
+        { name: 'alpha', path: '/tmp/alpha' },
+        { name: 'beta', path: '/tmp/beta' },
+      ]),
+    });
+    const repositoryPolicy = await createMcpRepositoryPolicy(backend, {
+      GITNEXUS_MCP_DEFAULT_REPO: 'alpha',
+    });
+    const server = createMCPServer(backend, { repositoryPolicy });
+    const client = new Client({ name: 'default-repo-client', version: '0.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+
+    try {
+      await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+      const tools = await client.listTools();
+      const query = tools.tools.find((tool) => tool.name === 'query');
+
+      expect(query?.inputSchema.required).not.toContain('repo');
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it('requires repo when multiple allowed repositories are visible without a default', async () => {
+    const backend = createMockBackend({
+      listRepos: vi.fn().mockResolvedValue([
+        { name: 'alpha', path: '/tmp/alpha' },
+        { name: 'beta', path: '/tmp/beta' },
+        { name: 'gamma', path: '/tmp/gamma' },
+      ]),
+    });
+    const repositoryPolicy = await createMcpRepositoryPolicy(backend, {
+      GITNEXUS_MCP_ALLOWED_REPOS: 'alpha,beta',
+    });
+    const server = createMCPServer(backend, { repositoryPolicy });
+    const client = new Client({ name: 'allowlisted-repos-client', version: '0.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+
+    try {
+      await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+      const tools = await client.listTools();
+      const query = tools.tools.find((tool) => tool.name === 'query');
+
+      expect(query?.inputSchema.required).toContain('repo');
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
 });
 
 // ─── getNextStepHint (tested indirectly via server tool handler) ──────
@@ -102,6 +251,206 @@ describe('getNextStepHint (via tool call response)', () => {
     // so we verify the handler was registered by creating the server without error.
     // The actual hint logic is tested via the integration path.
     expect(backend.callTool).not.toHaveBeenCalled(); // not called until request
+  });
+});
+
+describe('MCP output budgets', () => {
+  it('leaves the complete formatted response unchanged when no budget is configured', async () => {
+    const previous = process.env.GITNEXUS_MCP_DEFAULT_MAX_TOKENS;
+    delete process.env.GITNEXUS_MCP_DEFAULT_MAX_TOKENS;
+    try {
+      const backend = createMockBackend({
+        callTool: vi.fn().mockResolvedValue({ payload: 'complete' }),
+      });
+      const { text, isError } = await callToolThroughServer(backend, 'query', {
+        search_query: 'auth',
+      });
+      expect(isError).toBe(false);
+      expect(text).toContain('"payload": "complete"');
+      expect(text).toContain('**Next:**');
+      expect(text.endsWith('\n…')).toBe(false);
+    } finally {
+      if (previous === undefined) delete process.env.GITNEXUS_MCP_DEFAULT_MAX_TOKENS;
+      else process.env.GITNEXUS_MCP_DEFAULT_MAX_TOKENS = previous;
+    }
+  });
+
+  it('applies explicit maxTokens to the complete response deterministically and UTF-8 safely', async () => {
+    const backend = createMockBackend({
+      callTool: vi.fn().mockResolvedValue({ payload: '😀'.repeat(100) }),
+    });
+    const args = { search_query: 'auth', maxTokens: 8 };
+
+    const first = await callToolThroughServer(backend, 'query', args);
+    const second = await callToolThroughServer(backend, 'query', args);
+
+    expect(first.isError).toBe(false);
+    expect(first.text).toBe(second.text);
+    expect(Buffer.byteLength(first.text, 'utf8')).toBeLessThanOrEqual(8 * 4);
+    expect(first.text.endsWith('\n…')).toBe(true);
+    expect(first.text).not.toContain('\uFFFD');
+    expect(backend.callTool).toHaveBeenCalledWith('query', { search_query: 'auth' });
+  });
+
+  it('uses the environment default when maxTokens is omitted', async () => {
+    const previous = process.env.GITNEXUS_MCP_DEFAULT_MAX_TOKENS;
+    process.env.GITNEXUS_MCP_DEFAULT_MAX_TOKENS = '8';
+    try {
+      const backend = createMockBackend({
+        callTool: vi.fn().mockResolvedValue({ payload: 'x'.repeat(200) }),
+      });
+      const { text } = await callToolThroughServer(backend, 'context', { name: 'auth' });
+      expect(Buffer.byteLength(text, 'utf8')).toBeLessThanOrEqual(8 * 4);
+      expect(text.endsWith('\n…')).toBe(true);
+    } finally {
+      if (previous === undefined) delete process.env.GITNEXUS_MCP_DEFAULT_MAX_TOKENS;
+      else process.env.GITNEXUS_MCP_DEFAULT_MAX_TOKENS = previous;
+    }
+  });
+
+  it('lets an explicit request override the environment default', async () => {
+    const previous = process.env.GITNEXUS_MCP_DEFAULT_MAX_TOKENS;
+    process.env.GITNEXUS_MCP_DEFAULT_MAX_TOKENS = '1';
+    try {
+      const backend = createMockBackend({
+        callTool: vi.fn().mockResolvedValue({ payload: 'complete' }),
+      });
+      const { text } = await callToolThroughServer(backend, 'impact', {
+        target: 'auth',
+        direction: 'upstream',
+        maxTokens: 200,
+      });
+      expect(text).toContain('"payload": "complete"');
+      expect(text).toContain('**Next:**');
+      expect(text.endsWith('\n…')).toBe(false);
+    } finally {
+      if (previous === undefined) delete process.env.GITNEXUS_MCP_DEFAULT_MAX_TOKENS;
+      else process.env.GITNEXUS_MCP_DEFAULT_MAX_TOKENS = previous;
+    }
+  });
+
+  it('rejects unknown tool arguments before backend execution (#3261)', async () => {
+    const backend = createMockBackend();
+    const { text, isError } = await callToolThroughServer(backend, 'impact', {
+      target: 'auth',
+      direction: 'downstream',
+      notARealArg: 2,
+    });
+    expect(isError).toBe(true);
+    expect(text).toMatch(/Unknown argument "notARealArg" for tool "impact"/);
+    expect(backend.callTool).not.toHaveBeenCalled();
+  });
+
+  it('accepts CLI-style depth as a known impact alias (#3261)', async () => {
+    // The CLI flag is --depth; since #3261 MCP advertises it alongside maxDepth
+    // as a compatibility alias. Before #3261, `depth` was silently dropped.
+    // After the fix it is a known alias and is forwarded.
+    const backend = createMockBackend();
+    const { isError } = await callToolThroughServer(backend, 'impact', {
+      target: 'auth',
+      direction: 'downstream',
+      depth: 2,
+    });
+    expect(isError).toBe(false);
+    expect(backend.callTool).toHaveBeenCalledWith('impact', {
+      target: 'auth',
+      direction: 'downstream',
+      depth: 2,
+    });
+  });
+
+  it('still accepts unpublished context target through tools/call', async () => {
+    const backend = createMockBackend();
+    const { isError } = await callToolThroughServer(backend, 'context', {
+      repo: '@g1',
+      target: 'Sym',
+    });
+    expect(isError).toBe(false);
+    expect(backend.callTool).toHaveBeenCalledWith('context', { repo: '@g1', target: 'Sym' });
+  });
+
+  it('still accepts the unpublished query alias for query (#2175)', async () => {
+    const backend = createMockBackend();
+    const { isError } = await callToolThroughServer(backend, 'query', {
+      query: 'auth',
+    });
+    expect(isError).toBe(false);
+    expect(backend.callTool).toHaveBeenCalledWith('query', { query: 'auth' });
+  });
+
+  it('still accepts the unpublished query alias for cypher (#2175)', async () => {
+    const backend = createMockBackend();
+    const { isError } = await callToolThroughServer(backend, 'cypher', {
+      query: 'MATCH (n) RETURN n',
+    });
+    expect(isError).toBe(false);
+    expect(backend.callTool).toHaveBeenCalledWith('cypher', { query: 'MATCH (n) RETURN n' });
+  });
+
+  it('maps legacy search/explore names through the advertised schema (#3261)', async () => {
+    const backend = createMockBackend();
+    const searchUnknown = await callToolThroughServer(backend, 'search', { notARealArg: 1 });
+    expect(searchUnknown.isError).toBe(true);
+    expect(searchUnknown.text).toMatch(/Unknown argument "notARealArg"/);
+    expect(backend.callTool).not.toHaveBeenCalled();
+
+    const searchOk = await callToolThroughServer(backend, 'search', { query: 'auth' });
+    expect(searchOk.isError).toBe(false);
+    expect(backend.callTool).toHaveBeenCalledWith('search', { query: 'auth' });
+
+    backend.callTool.mockClear();
+    const exploreUnknown = await callToolThroughServer(backend, 'explore', { notARealArg: 1 });
+    expect(exploreUnknown.isError).toBe(true);
+    expect(backend.callTool).not.toHaveBeenCalled();
+
+    const exploreOk = await callToolThroughServer(backend, 'explore', {
+      repo: '@g1',
+      target: 'Sym',
+    });
+    expect(exploreOk.isError).toBe(false);
+    expect(backend.callTool).toHaveBeenCalledWith('explore', { repo: '@g1', target: 'Sym' });
+  });
+
+  it('rejects a non-positive explicit maxTokens before backend execution', async () => {
+    const backend = createMockBackend();
+    const { text, isError } = await callToolThroughServer(backend, 'query', {
+      search_query: 'auth',
+      maxTokens: 0,
+    });
+    expect(isError).toBe(true);
+    expect(text).toMatch(/maxTokens.*positive integer/i);
+    expect(backend.callTool).not.toHaveBeenCalled();
+  });
+
+  it('rejects an invalid environment default before backend execution', async () => {
+    const previous = process.env.GITNEXUS_MCP_DEFAULT_MAX_TOKENS;
+    process.env.GITNEXUS_MCP_DEFAULT_MAX_TOKENS = 'invalid';
+    try {
+      const backend = createMockBackend();
+      const { text, isError } = await callToolThroughServer(backend, 'query', {
+        search_query: 'auth',
+      });
+      expect(isError).toBe(true);
+      expect(text).toMatch(/GITNEXUS_MCP_DEFAULT_MAX_TOKENS.*positive integer/i);
+      expect(backend.callTool).not.toHaveBeenCalled();
+    } finally {
+      if (previous === undefined) delete process.env.GITNEXUS_MCP_DEFAULT_MAX_TOKENS;
+      else process.env.GITNEXUS_MCP_DEFAULT_MAX_TOKENS = previous;
+    }
+  });
+
+  it('applies a valid budget to backend error text', async () => {
+    const backend = createMockBackend({
+      callTool: vi.fn().mockRejectedValue(new Error('😀'.repeat(100))),
+    });
+    const { text, isError } = await callToolThroughServer(backend, 'context', {
+      name: 'auth',
+      maxTokens: 8,
+    });
+    expect(isError).toBe(true);
+    expect(Buffer.byteLength(text, 'utf8')).toBeLessThanOrEqual(8 * 4);
+    expect(text.endsWith('\n…')).toBe(true);
+    expect(text).not.toContain('\uFFFD');
   });
 });
 

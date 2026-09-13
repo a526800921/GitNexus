@@ -16,7 +16,8 @@
  * Usage:
  *   gitnexus eval-server                        # default port 4848, binds 127.0.0.1
  *   gitnexus eval-server --port 4848            # explicit port
- *   gitnexus eval-server --host 0.0.0.0         # reachable from other VMs / containers
+ *   GITNEXUS_AUTH_TOKEN=... gitnexus eval-server --host 0.0.0.0
+ *   GITNEXUS_AUTH_TOKEN=... gitnexus eval-server --host devbox.local
  *   gitnexus eval-server --idle-timeout 300     # auto-shutdown after 300s idle
  *
  * READY signal format: GITNEXUS_EVAL_SERVER_READY:<host>:<port>
@@ -31,8 +32,11 @@
 
 import http from 'http';
 import crypto from 'node:crypto';
+import { lookup } from 'node:dns/promises';
 import { isIPv4, isIPv6 } from 'node:net';
-import { writeSync } from 'node:fs';
+import { readFileSync, writeSync } from 'node:fs';
+import path from 'node:path';
+import { parseEnv } from 'node:util';
 import {
   LocalBackend,
   type RepoListing,
@@ -41,6 +45,7 @@ import {
 import { logger } from '../core/logger.js';
 import { cliInfo, cliWarn, cliError } from './cli-message.js';
 import { formatDetectChangesResult } from './detect-changes-format.js';
+import { formatSymbolLine } from './format-symbol.js';
 
 export { formatDetectChangesResult } from './detect-changes-format.js';
 
@@ -60,6 +65,112 @@ export function validateHost(raw: string): string | null {
   if (raw === 'localhost') return raw;
   if (isIPv4(raw) || isIPv6(raw)) return raw;
   return null;
+}
+
+type EvalServerHostLookup = (hostname: string) => Promise<string>;
+
+function isHostname(raw: string): boolean {
+  if (!raw || raw.length > 253 || /^[\d.]+$/.test(raw)) return false;
+  return raw
+    .split('.')
+    .every(
+      (label) =>
+        label.length > 0 &&
+        label.length <= 63 &&
+        /^[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?$/.test(label),
+    );
+}
+
+/** Resolve a DNS bind name once so validation and listen() use the same concrete address. */
+export async function resolveEvalServerBindHost(
+  raw: string,
+  resolveHostname: EvalServerHostLookup = async (hostname) =>
+    (await lookup(hostname, { family: 4 })).address,
+): Promise<string | null> {
+  const directHost = validateHost(raw);
+  if (directHost && directHost !== 'localhost') return directHost;
+  if (directHost !== 'localhost' && !isHostname(raw)) return null;
+
+  try {
+    const address = await resolveHostname(raw);
+    return isIPv4(address) ? address : null;
+  } catch {
+    return null;
+  }
+}
+
+function readAuthTokenFile(filePath: string): string | undefined {
+  try {
+    return parseEnv(readFileSync(filePath, 'utf8')).GITNEXUS_AUTH_TOKEN?.trim() || undefined;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw new Error(`Unable to read eval-server authentication from ${filePath}`, { cause: error });
+  }
+}
+
+/** Resolve the bearer token from the shell, then .env.local, then .env. */
+export function resolveEvalServerAuthToken(
+  env: NodeJS.ProcessEnv,
+  cwd: string = process.cwd(),
+): string | undefined {
+  if (Object.hasOwn(env, 'GITNEXUS_AUTH_TOKEN')) {
+    return env.GITNEXUS_AUTH_TOKEN?.trim() || undefined;
+  }
+
+  return (
+    readAuthTokenFile(path.join(cwd, '.env.local')) ?? readAuthTokenFile(path.join(cwd, '.env'))
+  );
+}
+
+/** True only for literal loopback addresses; DNS names are resolved before this check. */
+export function isEvalServerLoopbackHost(host: string): boolean {
+  return host === 'localhost' || host === '::1' || (isIPv4(host) && host.startsWith('127.'));
+}
+
+/**
+ * Resolve the bearer token for a concrete bind host. An unreadable `.env` /
+ * `.env.local` only matters when the binding actually requires a token, so
+ * loopback binds degrade to a warning instead of refusing to start; any
+ * non-loopback bind keeps the fail-closed error.
+ */
+export function resolveEvalServerAuthTokenForHost(
+  host: string,
+  env: NodeJS.ProcessEnv,
+  cwd: string = process.cwd(),
+): { token?: string; warning?: string } {
+  try {
+    return { token: resolveEvalServerAuthToken(env, cwd) };
+  } catch (error) {
+    if (isEvalServerLoopbackHost(host)) {
+      const reason = error instanceof Error ? error.message : String(error);
+      return { warning: `${reason} Continuing without authentication on loopback host ${host}.` };
+    }
+    throw error;
+  }
+}
+
+/** Refuse exposure of the eval-server query surface without authentication. */
+export function assertSecureEvalServerBinding(host: string, authToken: string | undefined): void {
+  if (!authToken && !isEvalServerLoopbackHost(host)) {
+    throw new Error(
+      `Refusing to start eval-server on non-loopback host ${host} without authentication. ` +
+        'Set GITNEXUS_AUTH_TOKEN or bind to 127.0.0.1, localhost, or ::1.',
+    );
+  }
+}
+
+/** Validate the exact Bearer header while keeping token comparison constant-time. */
+export function isEvalServerBearerAuthorized(
+  authorization: string | string[] | undefined,
+  authToken: string | undefined,
+): boolean {
+  if (!authToken) return true;
+
+  const expected = Buffer.from(`Bearer ${authToken}`, 'utf8');
+  const supplied = typeof authorization === 'string' ? Buffer.from(authorization, 'utf8') : null;
+  const sameLength = supplied?.length === expected.length;
+  const candidate = sameLength && supplied ? supplied : Buffer.alloc(expected.length);
+  return crypto.timingSafeEqual(candidate, expected) && sameLength;
 }
 
 // ─── Text Formatters ──────────────────────────────────────────────────
@@ -99,7 +210,7 @@ export function formatQueryResult(result: any): string {
   if (defs.length > 0) {
     lines.push(`Standalone definitions:`);
     for (const d of defs.slice(0, 8)) {
-      lines.push(`  ${d.type || 'Symbol'} ${d.name} → ${d.filePath || '?'}`);
+      lines.push(formatSymbolLine(d.type, d.name, d.filePath));
     }
     if (defs.length > 8) lines.push(`  ... and ${defs.length - 8} more`);
   }
@@ -189,6 +300,20 @@ function formatTruncationSuffix(result: {
       ? result.truncatedBy
       : '';
   return label ? ` (by ${label})` : '';
+}
+
+function pushCallgraphRiskLines(lines: string[], result: any): void {
+  if (result.risk) {
+    lines.push(`Risk: ${result.risk}`);
+  }
+  if (result.riskNote) {
+    lines.push(String(result.riskNote));
+  }
+  if (result.riskScale?.comparableAcrossKinds === false && result.riskSharedAxes) {
+    lines.push(
+      `Shared-axes risk: ${result.riskSharedAxes} (process/module axes are unavailable — compare File vs symbol only; do not use this to waive a HIGH/CRITICAL risk warning)`,
+    );
+  }
 }
 
 export function formatImpactResult(result: any): string {
@@ -456,14 +581,21 @@ export function formatImpactResult(result: any): string {
     // #1858 — "isolated" is a confident claim. If an interface / indirection
     // boundary is on the path, the true count is a lower bound, not zero;
     // callers binding via DI / dynamic dispatch were not traced. Say so instead.
+    const lines: string[] = [];
     if (result.epistemic === 'lower-bound') {
-      const lines = [
+      lines.push(
         `${target?.name || '?'}: no direct ${direction} dependencies traced, but this is a LOWER BOUND — unresolved indirection on the path (actual impact may be higher):`,
-      ];
+      );
       for (const b of result.boundaries || []) lines.push(`    • ${b}`);
-      return lines.join('\n');
+    } else if (direction === 'upstream') {
+      lines.push(
+        `${target?.name || '?'}: No ${direction} callers resolved. This is not evidence the symbol is unused or isolated.`,
+      );
+    } else {
+      lines.push(`${target?.name || '?'}: No ${direction} dependencies found.`);
     }
-    return `${target?.name || '?'}: No ${direction} dependencies found. This symbol appears isolated.`;
+    pushCallgraphRiskLines(lines, result);
+    return lines.join('\n');
   }
 
   const lines: string[] = [];
@@ -477,12 +609,23 @@ export function formatImpactResult(result: any): string {
   }
   // #1858 — an interface / indirection boundary on the path makes this a lower
   // bound; surface it so the count is not read as exhaustive.
+  //
+  // The header names no cause AND asserts no omitted caller, because it cannot
+  // know either. DI / dynamic dispatch was the only producer of `lower-bound`
+  // when this was written; #3399 added callables named in VALUE position (a
+  // registration table, a callback argument), and one of its producers is a
+  // probe that could not RUN — `callableValueReferenceBoundaries` hedges on a
+  // failed query and says in so many words that whether the symbol is
+  // registered is unknown. A header claiming "some callers are not traced"
+  // would there assert an omission nothing established, and would contradict
+  // the bullet printed directly under it. The bullets carry the cause — they
+  // are generated per-cause by `computeEpistemicBoundary` — so the header only
+  // has to say the count is a floor.
   if (result.epistemic === 'lower-bound') {
-    lines.push(
-      '⚠️  Lower bound — unresolved indirection on the path (callers binding via DI / dynamic dispatch are not traced; actual impact may be higher):',
-    );
+    lines.push('⚠️  Lower bound — impact may be incomplete and actual impact may be higher:');
     for (const b of result.boundaries || []) lines.push(`    • ${b}`);
   }
+  pushCallgraphRiskLines(lines, result);
   lines.push('');
 
   const depthLabels: Record<number, string> = {
@@ -650,18 +793,42 @@ export async function evalServerCommand(options?: EvalServerOptions): Promise<vo
   const idleTimeoutSec = parseInt(options?.idleTimeout || '0');
 
   const rawHost = options?.host ?? '127.0.0.1';
-  const host = validateHost(rawHost);
+  const host = await resolveEvalServerBindHost(rawHost);
   if (!host) {
     cliError(
       `Invalid --host value "${rawHost}":\n` +
-        `  Must be an IP address or "localhost".\n\n` +
+        `  Must be an IP address or a hostname that resolves to a local IPv4 address.\n\n` +
         `  Examples:\n` +
         `    gitnexus eval-server --host 127.0.0.1    (loopback only, default)\n` +
-        `    gitnexus eval-server --host 0.0.0.0      (all network interfaces)\n` +
-        `    gitnexus eval-server --host 192.168.1.5  (specific interface)\n` +
-        `    gitnexus eval-server --host localhost     (OS-resolved loopback)\n`,
+        `    GITNEXUS_AUTH_TOKEN=... gitnexus eval-server --host 0.0.0.0\n` +
+        `    GITNEXUS_AUTH_TOKEN=... gitnexus eval-server --host 192.168.1.5\n` +
+        `    gitnexus eval-server --host localhost     (resolved IPv4 loopback)\n` +
+        `    GITNEXUS_AUTH_TOKEN=... gitnexus eval-server --host devbox.local\n`,
       { flag: '--host', value: rawHost },
     );
+    process.exit(1);
+  }
+
+  let authToken: string | undefined;
+  try {
+    const resolved = resolveEvalServerAuthTokenForHost(host, process.env);
+    authToken = resolved.token;
+    if (resolved.warning) cliWarn(resolved.warning);
+  } catch (error) {
+    cliError(
+      error instanceof Error
+        ? error.message
+        : 'Unable to read eval-server authentication configuration.',
+    );
+    process.exit(1);
+  }
+
+  try {
+    assertSecureEvalServerBinding(host, authToken);
+  } catch (error) {
+    cliError(error instanceof Error ? error.message : 'Refusing insecure eval-server binding.', {
+      host,
+    });
     process.exit(1);
   }
 
@@ -705,6 +872,14 @@ export async function evalServerCommand(options?: EvalServerOptions): Promise<vo
   const shutdownToken = crypto.randomBytes(24).toString('hex');
 
   const server = http.createServer(async (req, res) => {
+    if (!isEvalServerBearerAuthorized(req.headers.authorization, authToken)) {
+      res.setHeader('Content-Type', 'application/json');
+      res.setHeader('WWW-Authenticate', 'Bearer');
+      res.writeHead(401);
+      res.end(JSON.stringify({ error: 'Unauthorized' }));
+      return;
+    }
+
     resetIdleTimer();
 
     try {
@@ -807,7 +982,7 @@ export async function evalServerCommand(options?: EvalServerOptions): Promise<vo
               `  Run \`ip addr\` (Linux) or \`ipconfig\` (Windows) to list available addresses.\n\n`) +
           `  Common fixes:\n` +
           `    gitnexus eval-server --host 127.0.0.1  (loopback, this machine only)\n` +
-          `    gitnexus eval-server --host 0.0.0.0    (all interfaces, reachable from other VMs)\n`,
+          `    GITNEXUS_AUTH_TOKEN=... gitnexus eval-server --host 0.0.0.0\n`,
         { code: err.code, port, host },
       );
     } else if (err.code === 'EACCES') {
@@ -856,6 +1031,9 @@ export async function evalServerCommand(options?: EvalServerOptions): Promise<vo
       `  GET  /health        — health check`,
       `  POST /shutdown      — graceful shutdown`,
     ];
+    if (authToken) {
+      bannerLines.push('  Bearer authentication enabled');
+    }
     if (idleTimeoutSec > 0) {
       bannerLines.push(`  Auto-shutdown after ${idleTimeoutSec}s idle`);
     }
@@ -863,6 +1041,7 @@ export async function evalServerCommand(options?: EvalServerOptions): Promise<vo
       port: boundPort,
       host,
       idleTimeoutSec: idleTimeoutSec > 0 ? idleTimeoutSec : undefined,
+      authEnabled: Boolean(authToken),
       endpoints: [
         'POST /tool/query',
         'POST /tool/context',

@@ -10,10 +10,10 @@ import fs from 'fs/promises';
 import path from 'path';
 import os from 'os';
 import { execFile, execFileSync } from 'child_process';
-import { createRequire } from 'module';
 import { promisify } from 'util';
 import { fileURLToPath } from 'url';
 import { parseTree, modify, applyEdits, ParseError, parse as parseJsonc } from 'jsonc-parser';
+import { packageVersion } from '../core/package-version.js';
 import { getGlobalDir } from '../storage/repo-manager.js';
 import {
   getEditorTargets,
@@ -33,11 +33,12 @@ const execFileAsync = promisify(execFile);
 // a config that persists in the user's editor and is invoked on every MCP
 // connect. Pinning to the installed version means subsequent invocations
 // skip the npm-registry metadata roundtrip (and stay reproducible until
-// the user upgrades). Static configs and READMEs intentionally use
-// `gitnexus@latest` since they're quickstart docs, not persisted state.
-const _require = createRequire(import.meta.url);
-const _pkg = _require('../../package.json') as { version?: unknown };
-if (typeof _pkg.version !== 'string' || !_pkg.version) {
+// the user upgrades). The plugin skill mcp.json are likewise pinned and
+// re-stamped every release by scripts/sync-plugin-manifests.mjs (#2445),
+// since they too execute `gitnexus@<version>` on connect. Only the READMEs
+// stay on `gitnexus@latest` — they're quickstart docs, not executed state.
+const PKG_VERSION = packageVersion();
+if (!PKG_VERSION) {
   throw new Error(
     'gitnexus/package.json#version is missing or not a string — cannot generate MCP fallback config.',
   );
@@ -45,7 +46,7 @@ if (typeof _pkg.version !== 'string' || !_pkg.version) {
 // Version-pinned ref for the persisted MCP entry — deliberately distinct from
 // the cjs's exported `gitnexus@latest` hint ref (resolve-analyze-cmd.cjs); the
 // two are not unified (see the comment above and that file's MCP_PINNED_REF).
-const MCP_PINNED_REF = `gitnexus@${_pkg.version}`;
+const MCP_PINNED_REF = `gitnexus@${PKG_VERSION}`;
 
 /**
  * Build the `command` string written into an editor's hook settings, which the
@@ -512,6 +513,7 @@ const HOOK_HELPERS = [
   'hook-db-lock-probe.cjs',
   'win-rm-list-json.ps1',
   'resolve-analyze-cmd.cjs',
+  'registry-query.cjs',
 ] as const;
 
 // win-rm-list-json.ps1 is best-effort: it is read (not require()'d) by
@@ -882,14 +884,15 @@ async function setupOpenCode(result: SetupResult): Promise<void> {
     return;
   }
 
-  const { file: configPath, keyPath } = mcpTarget('opencode');
+  const target = mcpTarget('opencode');
   try {
-    const ok = await mergeJsoncFile(configPath, keyPath, getOpenCodeMcpEntry());
+    const configPath = await resolveMcpConfigFile(target);
+    const ok = await mergeJsoncFile(configPath, target.keyPath, getOpenCodeMcpEntry());
     if (ok) {
       result.configured.push('OpenCode');
     } else {
       result.errors.push(
-        'OpenCode: opencode.json is corrupt — skipping to preserve existing content',
+        `OpenCode: ${path.basename(configPath)} is corrupt — skipping to preserve existing content`,
       );
     }
   } catch (err: any) {
@@ -1080,6 +1083,18 @@ async function setupCodex(result: SetupResult): Promise<void> {
 
 // ─── Skill Installation ───────────────────────────────────────────
 
+export const RENAMED_SKILL_DIRS: Readonly<Record<string, readonly string[]>> = {
+  'gitnexus-review': ['gitnexus-pr-review'],
+};
+
+/**
+ * Every legacy directory name superseded by a shipped rename. These no longer
+ * exist in the bundled skills/ source, but a pre-rename install left them
+ * behind in every editor target. Setup only warns about them (it cannot prove
+ * it owns the contents); uninstall's ownership-by-name contract removes them.
+ */
+export const LEGACY_SKILL_DIR_NAMES: readonly string[] = Object.values(RENAMED_SKILL_DIRS).flat();
+
 /**
  * Install GitNexus skills to a target directory.
  * Each skill is installed as {targetDir}/gitnexus-{skillName}/SKILL.md
@@ -1138,17 +1153,46 @@ async function installSkillsTo(targetDir: string): Promise<string[]> {
     const skillDir = path.join(targetDir, skillName);
 
     try {
-      if (source.isDirectory) {
-        const dirSource = path.join(skillsRoot, skillName);
-        await copyDirRecursive(dirSource, skillDir);
-        installed.push(skillName);
-      } else {
-        const flatSource = path.join(skillsRoot, `${skillName}.md`);
-        const content = await fs.readFile(flatSource, 'utf-8');
+      const sourceSkillPath = source.isDirectory
+        ? path.join(skillsRoot, skillName, 'SKILL.md')
+        : path.join(skillsRoot, `${skillName}.md`);
+      const destinationSkillPath = path.join(skillDir, 'SKILL.md');
+      const [sourceSkillContent, destinationSkillContent] = await Promise.all([
+        fs.readFile(sourceSkillPath, 'utf-8'),
+        fs.readFile(destinationSkillPath, 'utf-8').catch((err) => {
+          if (!isEnoent(err)) throw err;
+          return null;
+        }),
+      ]);
+
+      const preserved =
+        destinationSkillContent !== null && destinationSkillContent !== sourceSkillContent;
+      if (preserved && !source.isDirectory) {
+        console.log(
+          `[gitnexus] preserved customized skill ${destinationSkillPath}; ` +
+            'delete the file and rerun setup to refresh it.',
+        );
+      } else if (source.isDirectory) {
+        await copyDirRecursive(path.join(skillsRoot, skillName), skillDir);
+      } else if (!preserved) {
         await fs.mkdir(skillDir, { recursive: true });
-        await fs.writeFile(path.join(skillDir, 'SKILL.md'), content, 'utf-8');
-        installed.push(skillName);
+        await fs.writeFile(destinationSkillPath, sourceSkillContent, 'utf-8');
       }
+
+      // A directory superseded by a shipped rename is warned about, never
+      // deleted: the installer cannot prove it owns the contents (users
+      // customize installed skills or hand-write their own under these
+      // names), so an upgrade must not destroy data.
+      for (const oldName of RENAMED_SKILL_DIRS[skillName] ?? []) {
+        const legacyDir = path.join(targetDir, oldName);
+        if (await dirExists(legacyDir)) {
+          console.log(
+            `[gitnexus] skill "${oldName}" was renamed to "${skillName}"; ` +
+              `left ${legacyDir} in place — delete it manually if you have not customized it.`,
+          );
+        }
+      }
+      if (!preserved) installed.push(skillName);
     } catch {
       // Source skill not found — skip
     }
@@ -1168,9 +1212,23 @@ async function copyDirRecursive(src: string, dest: string): Promise<void> {
     const destPath = path.join(dest, entry.name);
     if (entry.isDirectory()) {
       await copyDirRecursive(srcPath, destPath);
-    } else {
-      await fs.copyFile(srcPath, destPath);
+      continue;
     }
+    const [srcBuf, destBuf] = await Promise.all([
+      fs.readFile(srcPath),
+      fs.readFile(destPath).catch((err) => {
+        if (!isEnoent(err)) throw err;
+        return null;
+      }),
+    ]);
+    if (destBuf !== null && !destBuf.equals(srcBuf)) {
+      console.log(
+        `[gitnexus] preserved customized skill ${destPath}; ` +
+          'delete the file and rerun setup to refresh it.',
+      );
+      continue;
+    }
+    await fs.writeFile(destPath, srcBuf);
   }
 }
 

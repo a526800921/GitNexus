@@ -4,8 +4,23 @@ import {
   doctorCommand,
   localEmbeddingDoctorStatus,
   padDisplayEnd,
+  nativeStatusLine,
   pageSizeDoctorLines,
+  poolSizeDoctorLine,
 } from '../../src/cli/doctor.js';
+import { setCliLanguage, type SupportedCliLanguage } from '../../src/cli/i18n/index.js';
+import type { NativeCheckResult } from '../../src/core/lbug/native-check.js';
+
+const nativeProbeState = vi.hoisted(() => ({ vectorLoaded: true }));
+
+vi.mock('../../src/core/lbug/native-check.js', () => ({
+  checkLbugNative: () => ({ ok: true, binaryPath: '/synthetic/lbugjs.node' }),
+  probeFtsExtensionLoad: async () => ({ loaded: true }),
+  probeVectorExtensionLoad: async () =>
+    nativeProbeState.vectorLoaded
+      ? { loaded: true }
+      : { loaded: false, reason: 'synthetic VECTOR load failure' },
+}));
 
 describe('doctor output formatting', () => {
   it('keeps ASCII padding equivalent to String.padEnd', () => {
@@ -23,6 +38,67 @@ describe('doctor output formatting', () => {
 
   it('does not truncate labels that are already wider than the target width', () => {
     expect(padDisplayEnd('图存储：', 4)).toBe('图存储：');
+  });
+});
+
+describe('doctor VECTOR capability claims', () => {
+  const ENV_KEYS = [
+    'GITNEXUS_EMBEDDING_URL',
+    'GITNEXUS_EMBEDDING_MODEL',
+    'GITNEXUS_EMBEDDING_DIMS',
+  ] as const;
+  const savedEnv = Object.fromEntries(ENV_KEYS.map((key) => [key, process.env[key]]));
+
+  const renderDoctor = async (
+    vectorLoaded: boolean,
+    language: SupportedCliLanguage = 'en',
+  ): Promise<string> => {
+    nativeProbeState.vectorLoaded = vectorLoaded;
+    setCliLanguage(language);
+    process.env.GITNEXUS_EMBEDDING_URL = 'http://127.0.0.1:9/v1';
+    process.env.GITNEXUS_EMBEDDING_MODEL = 'synthetic-doctor';
+    process.env.GITNEXUS_EMBEDDING_DIMS = '384';
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+    await doctorCommand();
+
+    return log.mock.calls.map((args) => args.map(String).join(' ')).join('\n');
+  };
+
+  afterEach(() => {
+    nativeProbeState.vectorLoaded = true;
+    setCliLanguage(null);
+    vi.restoreAllMocks();
+    for (const key of ENV_KEYS) {
+      if (savedEnv[key] === undefined) delete process.env[key];
+      else process.env[key] = savedEnv[key];
+    }
+  });
+
+  it('reports a loaded extension without claiming a repository index exists', async () => {
+    const output = await renderDoctor(true);
+
+    expect(output).toContain('VECTOR extension: available');
+    expect(output).toContain(
+      'Semantic support: vector-index capable (repository index not checked)',
+    );
+    expect(output).not.toContain('VECTOR index:');
+    expect(output).not.toContain('Semantic mode:');
+  });
+
+  it('reports exact-scan capability when the extension cannot load', async () => {
+    const output = await renderDoctor(false);
+
+    expect(output).toContain('VECTOR extension: unavailable');
+    expect(output).toContain('Semantic support: exact-scan only (VECTOR extension unavailable)');
+  });
+
+  it('keeps the corrected capability claims localized', async () => {
+    const output = await renderDoctor(true, 'zh-CN');
+
+    expect(output).toContain('VECTOR 扩展：');
+    expect(output).toContain('语义支持：');
+    expect(output).toContain('支持向量索引（未检查仓库索引）');
   });
 });
 
@@ -161,6 +237,63 @@ describe('doctor page-size lines (#1231, #2424 review)', () => {
     expect(lines[1]).toContain('an unknown @ladybugdb/core version (may predate 0.18.0)');
     expect(lines[1]).not.toContain('with @ladybugdb/core < 0.18.0');
     expect(lines[1]).toContain('npm install -g gitnexus@latest');
+  });
+});
+
+describe('doctor pool-size line (#2631)', () => {
+  const MiB = 1024 * 1024;
+
+  it('prints the hintless pool in MiB with no env note when the env var is unset', () => {
+    expect(poolSizeDoctorLine(2048 * MiB, undefined)).toBe(
+      `  ${padDisplayEnd('pool size', 10)}2048 MiB`,
+    );
+  });
+
+  it('marks an operator-supplied absolute value as an env override, with no scaling suffix', () => {
+    expect(poolSizeDoctorLine(4096 * MiB, String(4096 * MiB))).toBe(
+      `  ${padDisplayEnd('pool size', 10)}4096 MiB (env override)`,
+    );
+  });
+
+  it('labels the 0 sentinel as the native default instead of "0 MiB"', () => {
+    expect(poolSizeDoctorLine(0, '0')).toBe(
+      `  ${padDisplayEnd('pool size', 10)}native 80% of RAM (env override)`,
+    );
+  });
+});
+
+// #2672: every failed check used to print "lbugjs.node missing", including the
+// glibc case where the binary is present and merely unloadable — contradicting
+// the detail printed directly beneath it and sending users to reinstall a file
+// they already had.
+describe('doctor native status line (#2672)', () => {
+  const nativeStatusCases: ReadonlyArray<readonly [string, NativeCheckResult, string]> = [
+    ['a loaded binary', { ok: true, binaryPath: '/x/lbugjs.node' }, '✓ lbugjs.node loaded'],
+    [
+      'an uninstalled package',
+      { ok: false, kind: 'package_missing', message: 'x' },
+      '✗ @ladybugdb/core not installed',
+    ],
+    [
+      'an absent binary',
+      { ok: false, kind: 'binary_missing', binaryPath: '/x/lbugjs.node', message: 'x' },
+      '✗ lbugjs.node missing',
+    ],
+    [
+      'a present-but-unloadable binary (glibc too old, truncated download)',
+      { ok: false, kind: 'load_failed', binaryPath: '/x/lbugjs.node', message: 'x' },
+      '✗ lbugjs.node present but failed to load',
+    ],
+    [
+      'a prebuilt that exists but could not be copied into a read-only node_modules',
+      { ok: false, kind: 'binary_unwritable', binaryPath: '/x/lbugjs.node', message: 'x' },
+      '✗ lbugjs.node not installed (node_modules not writable)',
+    ],
+    ['a failure with no kind recorded', { ok: false, message: 'x' }, '✗ lbugjs.node missing'],
+  ];
+
+  it.each(nativeStatusCases)('reports %s', (_name, check, expected) => {
+    expect(nativeStatusLine(check)).toBe(`  ${padDisplayEnd('native', 10)}${expected}`);
   });
 });
 

@@ -14,6 +14,9 @@ const execFileMock = vi.fn((...args: any[]) => {
 
 vi.mock('child_process', () => ({
   execFile: execFileMock,
+  // uninstall.ts imports setup.ts (for LEGACY_SKILL_DIR_NAMES), which also
+  // imports execFileSync — the mock must export it or the import throws.
+  execFileSync: vi.fn(),
 }));
 
 describe('uninstallCommand', () => {
@@ -154,6 +157,24 @@ describe('uninstallCommand', () => {
     await expect(fs.access(path.join(skillsDir, 'my-skill'))).resolves.toBeUndefined();
   });
 
+  // ── renamed skills: the legacy dir name must still be uninstalled ──
+  it('removes a legacy renamed skill dir (gitnexus-pr-review) absent from the bundled source', async () => {
+    const skillsDir = path.join(tempHome, '.claude', 'skills');
+    // A pre-rename install left the old name behind; the fixture skillsRoot
+    // (post-rename bundled source) does not contain it.
+    await fs.mkdir(path.join(skillsDir, 'gitnexus-pr-review'), { recursive: true });
+    await fs.writeFile(path.join(skillsDir, 'gitnexus-pr-review', 'SKILL.md'), '# old', 'utf-8');
+    // A user's own skill that must survive.
+    await fs.mkdir(path.join(skillsDir, 'my-skill'), { recursive: true });
+    await fs.writeFile(path.join(skillsDir, 'my-skill', 'SKILL.md'), '# mine', 'utf-8');
+
+    const uninstallCommand = await importUninstall();
+    await uninstallCommand({ force: true });
+
+    await expect(fs.access(path.join(skillsDir, 'gitnexus-pr-review'))).rejects.toThrow();
+    await expect(fs.access(path.join(skillsDir, 'my-skill'))).resolves.toBeUndefined();
+  });
+
   it('strips the [mcp_servers.gitnexus] section from Codex config.toml, keeping other tables', async () => {
     const codexDir = path.join(tempHome, '.codex');
     await fs.mkdir(codexDir, { recursive: true });
@@ -291,6 +312,59 @@ describe('uninstallCommand', () => {
     const config = JSON.parse(await fs.readFile(opencodeJson, 'utf-8'));
     expect(config.mcp.gitnexus).toBeUndefined();
     expect(config.mcp.other).toEqual({ type: 'local', command: ['foo'] });
+  });
+
+  it.each(['opencode.jsonc', 'config.json'])(
+    'removes the gitnexus entry from OpenCode %s, preserving comments',
+    async (fileName) => {
+      const configPath = path.join(tempHome, '.config', 'opencode', fileName);
+      await fs.mkdir(path.dirname(configPath), { recursive: true });
+      await fs.writeFile(
+        configPath,
+        [
+          '{',
+          '  // keep this comment',
+          '  "mcp": {',
+          '    "gitnexus": { "type": "local", "command": ["gitnexus", "mcp"] },',
+          '    "other": { "type": "local", "command": ["foo"] }',
+          '  }',
+          '}',
+        ].join('\n'),
+        'utf-8',
+      );
+
+      const uninstallCommand = await importUninstall();
+      await uninstallCommand({ force: true });
+
+      const raw = await fs.readFile(configPath, 'utf-8');
+      expect(raw).toContain('keep this comment');
+      expect(raw).not.toContain('"gitnexus"');
+      expect(raw).toContain('"other"');
+    },
+  );
+
+  it('leaves OpenCode config.jsonc untouched because OpenCode does not read it', async () => {
+    const configJsonc = path.join(tempHome, '.config', 'opencode', 'config.jsonc');
+    await fs.mkdir(path.dirname(configJsonc), { recursive: true });
+    await fs.writeFile(
+      configJsonc,
+      [
+        '{',
+        '  // keep this comment',
+        '  "mcp": {',
+        '    "gitnexus": { "type": "local", "command": ["gitnexus", "mcp"] },',
+        '    "other": { "type": "local", "command": ["foo"] }',
+        '  }',
+        '}',
+      ].join('\n'),
+      'utf-8',
+    );
+
+    const uninstallCommand = await importUninstall();
+    await uninstallCommand({ force: true });
+
+    const raw = await fs.readFile(configJsonc, 'utf-8');
+    expect(raw).toContain('"gitnexus"');
   });
 
   // ── Antigravity MCP + hooks (AfterTool / gitnexus-antigravity-hook) ──

@@ -39,6 +39,17 @@ describe('VALID_RELATION_TYPES', () => {
     'WRAPS',
     // Spring DI @Autowired collection injection (#2200)
     'INJECTS',
+    // Conditional activation and metadata declaration/discovery (#2415)
+    'CONDITIONAL_ON',
+    'DECLARES',
+    // Spring proxy/advice evidence (#2416)
+    'ADVISED_BY',
+    // Spring async messaging: a callable publishes to / consumes from a broker
+    // Destination. Allow-listed so a cypher query may name them; both are
+    // deliberately absent from impact()'s DEFAULT relTypes, exactly as
+    // HANDLES_ROUTE is, so the default blast radius is unchanged.
+    'PUBLISHES_TO',
+    'CONSUMES_FROM',
   ] as const;
 
   it('contains all expected relation types', () => {
@@ -161,5 +172,13 @@ describe('path traversal (isTestFilePath as proxy for path handling)', () => {
   it('isTestFilePath returns false for non-test files', () => {
     expect(isTestFilePath('src/main.ts')).toBe(false);
     expect(isTestFilePath('src/utils/helper.ts')).toBe(false);
+  });
+
+  it('isTestFilePath returns false for nodes without a filePath', () => {
+    // trace BFS visits Community/Process nodes whose rows carry no filePath;
+    // the guard must return false instead of throwing on undefined/null.
+    expect(isTestFilePath(undefined)).toBe(false);
+    expect(isTestFilePath(null)).toBe(false);
+    expect(isTestFilePath('')).toBe(false);
   });
 });

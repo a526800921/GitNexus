@@ -9,12 +9,37 @@
  */
 
 import type { Express, Request, Response } from 'express';
-import { createStreamableHttpHandler } from '../mcp/http-transport.js';
+import {
+  createAuthMiddleware,
+  createStreamableHttpHandler,
+  resolveAuthToken,
+} from '../mcp/http-transport.js';
 import type { LocalBackend } from '../mcp/local/local-backend.js';
+import { createMcpRepositoryPolicy } from '../mcp/repository-policy.js';
 import { logger } from '../core/logger.js';
 
-export function mountMCPEndpoints(app: Express, backend: LocalBackend): () => Promise<void> {
-  const { handler, cleanup } = createStreamableHttpHandler(backend);
+/**
+ * Protect serve's /api/mcp route when the shared MCP bearer token is configured.
+ *
+ * This middleware must be installed before Express's global JSON parser so an
+ * unauthenticated request body is rejected before it is parsed. The standalone
+ * `gitnexus mcp --http` server resolves the same environment variable.
+ */
+export function installServeMcpAuth(app: Express, env: NodeJS.ProcessEnv = process.env): boolean {
+  const authToken = resolveAuthToken(undefined, env);
+  if (!authToken) return false;
+
+  app.use('/api/mcp', createAuthMiddleware(authToken));
+  logger.info('Bearer authentication enabled for serve /api/mcp');
+  return true;
+}
+
+export async function mountMCPEndpoints(
+  app: Express,
+  backend: LocalBackend,
+): Promise<() => Promise<void>> {
+  const repositoryPolicy = await createMcpRepositoryPolicy(backend);
+  const { handler, cleanup } = createStreamableHttpHandler(backend, { repositoryPolicy });
 
   app.all('/api/mcp', (req: Request, res: Response) => {
     void handler(req, res).catch((err: unknown) => {

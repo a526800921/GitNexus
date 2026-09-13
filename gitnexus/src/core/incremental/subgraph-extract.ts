@@ -6,9 +6,10 @@
  * replaced, produce a smaller KnowledgeGraph that contains:
  *
  *   - Every node whose `properties.filePath` is in `toWriteSet`.
- *   - Every graph-wide node (Community, Process) — these are regenerated
- *     each run by the communities/processes phases and must be fully
- *     rewritten.
+ *   - Graph-wide Community/Process nodes unless `includeDerivedGraphWide`
+ *     is false (#3016 incremental preserve). Spring metadata placeholders
+ *     and `Destination` nodes are always included — their owning phase
+ *     delete-alls them unconditionally before the writeback.
  *   - Every relationship where AT LEAST ONE endpoint is in the writable
  *     set above. Relationships entirely between unchanged-file nodes
  *     are skipped — their rows are still in the DB and re-inserting
@@ -51,8 +52,39 @@
 import type { GraphNode, GraphRelationship } from 'gitnexus-shared';
 import { createKnowledgeGraph } from '../graph/graph.js';
 import type { KnowledgeGraph } from '../graph/types.js';
+import {
+  isSpringAutoConfigurationDeclaration,
+  isSpringAutoConfigurationSyntheticClass,
+} from '../ingestion/frameworks/spring/auto-configuration.js';
+import { isSpringAopEvidenceNode } from '../ingestion/frameworks/spring/aop.js';
 
-const isGraphWide = (label: string): boolean => label === 'Community' || label === 'Process';
+/**
+ * `Destination` is graph-wide for the same reason as the Spring AOP evidence
+ * nodes: the layer is recomputed in full on every run and deleted in full
+ * before the writeback (`deleteAllDestinations`), so it must be re-included in
+ * full or it is simply lost.
+ *
+ * The endpoint-writability rule cannot carry it. A RESOLVED destination stores
+ * no `filePath` at all — deliberately, so an incremental delete keyed on
+ * `filePath IN [...]` cannot cut a node shared across files — and the include
+ * test below starts from exactly that property. The result was a defect in both
+ * directions: a newly added file publishing to a new topic reported
+ * `added=1, exit 0` and silently put neither the destination nor the
+ * publisher's edge into the graph, so after the first index every new topic was
+ * invisible until a full rebuild; and a destination whose last referrer stopped
+ * referring to it survived forever as an edgeless orphan still carrying
+ * `address`, the cross-repository join key.
+ *
+ * Unresolved destinations DO carry a file path and would ride the ordinary
+ * rule, but they are included here too: the delete-all removes them as well, so
+ * anything not re-included would be dropped rather than merely stale.
+ */
+const isGraphWideNode = (node: GraphNode): boolean =>
+  node.label === 'Community' ||
+  node.label === 'Process' ||
+  node.label === 'Destination' ||
+  isSpringAopEvidenceNode(node) ||
+  isSpringAutoConfigurationSyntheticClass(node);
 
 /**
  * Relationship types whose VALIDITY is a whole-program property, not a
@@ -81,8 +113,21 @@ const isGraphWide = (label: string): boolean => label === 'Community' || label =
 // analyze, and the `incrementalInProgress` dirty flag (saved before any
 // delete) forces a full rebuild on the next run. Temporary absence is
 // possible; duplicates are not.
-const isGraphWideRelType = (type: string): boolean =>
-  type === 'TAINT_PATH' || type === 'CALL_SUMMARY' || type === 'INJECTS';
+//
+// Spring auto-configuration DECLARES edges (#2415) are also recomputed from
+// repository-wide metadata. A third-file class addition/removal can retarget
+// an unchanged declaration, so they need the same global re-extract contract.
+// DECLARES itself is generic, however: only the two Spring-owned reasons are
+// graph-wide, leaving future metadata systems under their own lifecycle.
+const isGraphWideRelationship = (relationship: GraphRelationship): boolean =>
+  relationship.type === 'TAINT_PATH' ||
+  relationship.type === 'CALL_SUMMARY' ||
+  relationship.type === 'INJECTS' ||
+  // Spring pointcut matching (#2416) is repository-wide. A third-file change
+  // can alter annotation-name visibility or the set matched by a wildcard,
+  // even when neither endpoint file changed.
+  relationship.type === 'ADVISED_BY' ||
+  isSpringAutoConfigurationDeclaration(relationship);
 
 /**
  * Build a Map<nodeId, filePath> for every File-bound node in the graph.
@@ -100,13 +145,18 @@ const indexNodeFilePaths = (fullGraph: KnowledgeGraph): Map<string, string> => {
 export const extractChangedSubgraph = (
   fullGraph: KnowledgeGraph,
   toWriteSet: ReadonlySet<string>,
+  options?: { includeDerivedGraphWide?: boolean },
 ): KnowledgeGraph => {
   const sub = createKnowledgeGraph();
   const writableNodeIds = new Set<string>();
 
+  const includeDerivedGraphWide = options?.includeDerivedGraphWide !== false;
+
   fullGraph.forEachNode((n: GraphNode) => {
     const filePath = n.properties?.filePath as string | undefined;
-    const include = (filePath && toWriteSet.has(filePath)) || isGraphWide(n.label);
+    const derivedWide =
+      includeDerivedGraphWide || (n.label !== 'Community' && n.label !== 'Process');
+    const include = (filePath && toWriteSet.has(filePath)) || (isGraphWideNode(n) && derivedWide);
     if (include) {
       sub.addNode(n);
       writableNodeIds.add(n.id);
@@ -117,7 +167,7 @@ export const extractChangedSubgraph = (
     if (
       writableNodeIds.has(r.sourceId) ||
       writableNodeIds.has(r.targetId) ||
-      isGraphWideRelType(r.type)
+      isGraphWideRelationship(r)
     ) {
       sub.addRelationship(r);
     }
@@ -128,10 +178,13 @@ export const extractChangedSubgraph = (
 
 /**
  * Public — derive the EFFECTIVE write-set: `toWriteSet` expanded by one
- * hop along every edge in the new graph that crosses the writable
- * boundary (one endpoint in a writable file, the other in an unchanged
- * file). The unchanged-side file is pulled in so its stale rows are
- * deleted + rewritten in lockstep with the changed side.
+ * hop along every file-owned edge in the new graph that crosses the
+ * writable boundary (one endpoint in a writable file, the other in an
+ * unchanged file). Graph-wide relationships are excluded: their owner
+ * phase delete-alls and re-extracts them independently, so following them
+ * here would turn high-fan-out metadata into a near-full-repository write.
+ * For ordinary edges, the unchanged-side file is pulled in so its stale
+ * rows are deleted + rewritten in lockstep with the changed side.
  *
  * Single pass over the edge list. Does NOT mutate `toWriteSet`. The
  * orchestrator MUST feed the returned set to both `deleteNodesForFiles`
@@ -145,6 +198,7 @@ export const computeEffectiveWriteSet = (
   const nodeFilePaths = indexNodeFilePaths(fullGraph);
   const expanded = new Set<string>(toWriteSet);
   fullGraph.forEachRelationship((r: GraphRelationship) => {
+    if (isGraphWideRelationship(r)) return;
     const sourcePath = nodeFilePaths.get(r.sourceId);
     const targetPath = nodeFilePaths.get(r.targetId);
     if (!sourcePath || !targetPath) return; // skip edges to graph-wide nodes

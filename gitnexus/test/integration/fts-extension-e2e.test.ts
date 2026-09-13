@@ -25,9 +25,9 @@ import path from 'path';
 import fs from 'fs';
 import os from 'os';
 
-import lbug from '@ladybugdb/core';
 import { getExtensionInstallChildProcessArgs } from '../../src/core/lbug/extension-loader.js';
 import { cleanupTempDirSync } from '../helpers/test-db.js';
+import { findInstalledFtsExtension } from '../helpers/fts-availability.js';
 
 /** `.lbdb/extension/<version>/<platform>/fts/libfts.lbug_extension`, discovered not hardcoded. */
 let extensionRelPath: string;
@@ -52,16 +52,12 @@ const makeTmpDir = (label: string): string => {
  * home — the production installer script, not a reimplementation.
  */
 const resolveSeedExtension = (): void => {
-  const relBase = path.join('.lbdb', 'extension', lbug.VERSION);
-  const realVersionDir = path.join(os.homedir(), relBase);
-  const platformDirs = fs.existsSync(realVersionDir) ? fs.readdirSync(realVersionDir) : [];
-  for (const platform of platformDirs) {
-    const candidate = path.join(realVersionDir, platform, 'fts', 'libfts.lbug_extension');
-    if (fs.existsSync(candidate) && fs.statSync(candidate).size > 1024 * 1024) {
-      extensionRelPath = path.join(relBase, platform, 'fts', 'libfts.lbug_extension');
-      seedExtensionFile = candidate;
-      return;
-    }
+  const realExtensionRoot = path.join(os.homedir(), '.lbdb', 'extension');
+  const installed = findInstalledFtsExtension(realExtensionRoot);
+  if (installed) {
+    extensionRelPath = path.relative(os.homedir(), installed);
+    seedExtensionFile = installed;
+    return;
   }
   // No local copy — run the real installer against a hermetic probe home.
   const probeHome = makeTmpDir('seed-home');
@@ -70,16 +66,13 @@ const resolveSeedExtension = (): void => {
     timeout: 120_000,
     env: { ...process.env, HOME: probeHome, USERPROFILE: probeHome },
   });
-  const probeVersionDir = path.join(probeHome, relBase);
-  const probePlatforms = fs.existsSync(probeVersionDir) ? fs.readdirSync(probeVersionDir) : [];
-  for (const platform of probePlatforms) {
-    const candidate = path.join(probeVersionDir, platform, 'fts', 'libfts.lbug_extension');
-    if (install.status === 0 && fs.existsSync(candidate)) {
-      extensionRelPath = path.join(relBase, platform, 'fts', 'libfts.lbug_extension');
-      seedExtensionFile = candidate;
-      networkAvailable = true;
-      return;
-    }
+  const probeExtensionRoot = path.join(probeHome, '.lbdb', 'extension');
+  const probeInstalled = findInstalledFtsExtension(probeExtensionRoot);
+  if (install.status === 0 && probeInstalled) {
+    extensionRelPath = path.relative(probeHome, probeInstalled);
+    seedExtensionFile = probeInstalled;
+    networkAvailable = true;
+    return;
   }
 };
 
@@ -298,6 +291,56 @@ describe('unhappy path — extension missing entirely', () => {
     expect(result.output).toContain('has not been installed');
     expect(result.output).not.toContain('Failed to load library');
   }, 180_000);
+});
+
+describe('regression — the extension disappears between analyze runs (#2841)', () => {
+  it('the incremental run completes with a full DB write instead of an opaque Binder exception', (ctx) => {
+    const { home, extensionFile } = makeHome('valid');
+    const repo = makeFixtureRepo('vanishing-extension');
+
+    // 1. First analyze with the extension in place: the index ends up carrying
+    //    an FTS index on every searchable table.
+    const first = runCli(['analyze'], repo, home, 'load-only');
+    expect(first.status).toBe(0);
+    // This case needs run 1 to actually BUILD the indexes — without them there
+    // is nothing for the gate to trip on and the assertions below would be
+    // vacuous. When the seeded extension cannot load on this host (the same
+    // environment gap the other cases in this file hit), skip VISIBLY rather
+    // than report a red that says nothing about the fix.
+    if (first.output.includes('FTS extension unavailable')) {
+      if (REQUIRE_FTS) {
+        throw new Error(
+          'GITNEXUS_REQUIRE_FTS=1 but the seeded FTS extension did not load — cannot verify the #2841 regression.',
+        );
+      }
+      ctx.skip();
+    }
+
+    // 2. The extension becomes unloadable — the reporter moved
+    //    ~/.lbdb/extension away; a HOME change or a wiped cache does the same.
+    fs.rmSync(extensionFile);
+
+    // 3. A content change makes the next run incremental, so it must rewrite
+    //    rows of tables that still carry the indexes from step 1.
+    fs.appendFileSync(path.join(repo, 'src', 'greeter.ts'), '\n// #2841 incremental touch\n');
+    const gitEnv = {
+      ...process.env,
+      GIT_AUTHOR_NAME: 'test',
+      GIT_AUTHOR_EMAIL: 'test@test',
+      GIT_COMMITTER_NAME: 'test',
+      GIT_COMMITTER_EMAIL: 'test@test',
+    };
+    spawnSync('git', ['add', '-A'], { cwd: repo, stdio: 'pipe' });
+    spawnSync('git', ['commit', '-m', '#2841 touch'], { cwd: repo, stdio: 'pipe', env: gitEnv });
+
+    const second = runCli(['analyze'], repo, home, 'load-only');
+    // Pre-fix: exit 1 with "Binder exception: Trying to delete from an index on
+    // table File but its extension is not loaded" and no mention of FTS at all.
+    expect(second.status).toBe(0);
+    expect(second.output).not.toContain('its extension is not loaded');
+    expect(second.output).toContain('full DB write');
+    expect(second.output).toContain('FTS');
+  }, 400_000);
 });
 
 describe('self-heal over the network — FORCE INSTALL replaces a broken file (auto)', () => {
