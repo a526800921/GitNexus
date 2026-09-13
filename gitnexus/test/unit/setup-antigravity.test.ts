@@ -288,6 +288,33 @@ describe('setupAntigravity', () => {
     }
   });
 
+  it('does not install project-local workflow skills globally', async () => {
+    const excludedSkills = ['gitnexus-plan', 'gitnexus-work', 'gitnexus-lfg'];
+    const fixtureSkillsRoot = path.join(tempHome, 'fixture-skills');
+    for (const skillName of excludedSkills) {
+      await fs.mkdir(path.join(fixtureSkillsRoot, skillName), { recursive: true });
+      await fs.writeFile(
+        path.join(fixtureSkillsRoot, skillName, 'SKILL.md'),
+        `---\nname: ${skillName}\ndescription: fixture\n---\nbody\n`,
+        'utf-8',
+      );
+    }
+    const originalSkillsRoot = process.env.GITNEXUS_TEST_SKILLS_ROOT;
+    process.env.GITNEXUS_TEST_SKILLS_ROOT = fixtureSkillsRoot;
+
+    try {
+      const { setupCommand } = await import('../../src/cli/setup.js');
+      await setupCommand();
+
+      const skillsDir = path.join(tempHome, '.gemini', 'antigravity', 'skills');
+      for (const skillName of excludedSkills) {
+        await expect(fs.access(path.join(skillsDir, skillName, 'SKILL.md'))).rejects.toThrow();
+      }
+    } finally {
+      restoreSkillsRoot(originalSkillsRoot);
+    }
+  });
+
   it('preserves a customized installed skill when setup is rerun', async () => {
     const fixtureSkillsRoot = path.join(tempHome, 'fixture-skills');
     const installedSkill = path.join(

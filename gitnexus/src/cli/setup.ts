@@ -1088,6 +1088,16 @@ export const RENAMED_SKILL_DIRS: Readonly<Record<string, readonly string[]>> = {
 };
 
 /**
+ * Workflow skills that are intentionally kept project-local. Setup must not
+ * copy these into any user's global editor skill directory.
+ */
+export const SETUP_EXCLUDED_SKILL_NAMES: ReadonlySet<string> = new Set([
+  'gitnexus-plan',
+  'gitnexus-work',
+  'gitnexus-lfg',
+]);
+
+/**
  * Every legacy directory name superseded by a shipped rename. These no longer
  * exist in the bundled skills/ source, but a pre-rename install left them
  * behind in every editor target. Setup only warns about them (it cannot prove
@@ -1140,11 +1150,14 @@ async function installSkillsTo(targetDir: string): Promise<string[]> {
   const skillSources = new Map<string, { isDirectory: boolean }>();
 
   for (const relPath of dirSkillFiles) {
-    skillSources.set(path.dirname(relPath), { isDirectory: true });
+    const skillName = path.dirname(relPath);
+    if (!SETUP_EXCLUDED_SKILL_NAMES.has(skillName)) {
+      skillSources.set(skillName, { isDirectory: true });
+    }
   }
   for (const relPath of flatFiles) {
     const skillName = path.basename(relPath, '.md');
-    if (!skillSources.has(skillName)) {
+    if (!SETUP_EXCLUDED_SKILL_NAMES.has(skillName) && !skillSources.has(skillName)) {
       skillSources.set(skillName, { isDirectory: false });
     }
   }
